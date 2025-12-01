@@ -77,10 +77,7 @@
 ### Using Docker
 
 ```bash
-# Run instantly
-docker run -p 8080:8080 ghcr.io/yourusername/pdf-forge:latest
-
-# Or with configuration
+  # with configuration
 docker run -p 8080:8080 \
   -e API_KEY="your-secret-key" \
   -e MAX_WORKERS=8 \
@@ -90,7 +87,7 @@ docker run -p 8080:8080 \
 ### Test It
 
 ```bash
-# Health check
+  # Health check
 curl http://localhost:8080/health
 
 # Simple HTML to PDF
@@ -99,7 +96,7 @@ curl -X POST http://localhost:8080/html \
   -d '{"html": "<h1>Hello World</h1>"}' \
   -o hello.pdf
 
-# Password protected PDF
+  # Password protected PDF
 curl -X POST http://localhost:8080/convert \
   -H "Content-Type: application/json" \
   -d '{
@@ -158,7 +155,7 @@ curl -X POST http://localhost:8080/convert \
 ### Invoice Example
 
 ```bash
-curl -X POST http://localhost:8080/template \
+  curl -X POST http://localhost:8080/template \
   -H "Content-Type: application/json" \
   -d '{
     "template": "invoice",
@@ -185,7 +182,7 @@ curl -X POST http://localhost:8080/template \
 ### Certificate Example
 
 ```bash
-curl -X POST http://localhost:8080/template \
+  curl -X POST http://localhost:8080/template \
   -H "Content-Type: application/json" \
   -d '{
     "template": "certificate",
@@ -207,7 +204,7 @@ curl -X POST http://localhost:8080/template \
 ### Custom Template
 
 ```bash
-curl -X POST http://localhost:8080/template \
+  curl -X POST http://localhost:8080/template \
   -H "Content-Type: application/json" \
   -d '{
     "template": "custom",
@@ -227,7 +224,7 @@ curl -X POST http://localhost:8080/template \
 
 ```bash
 # Split into individual pages
-curl -X POST http://localhost:8080/manipulate \
+  curl -X POST http://localhost:8080/manipulate \
   -H "Content-Type: application/json" \
   -d "{
     \"operation\": \"split\",
@@ -239,7 +236,7 @@ curl -X POST http://localhost:8080/manipulate \
 ### Compress PDF
 
 ```bash
-curl -X POST http://localhost:8080/manipulate \
+  curl -X POST http://localhost:8080/manipulate \
   -d "{
     \"operation\": \"compress\",
     \"pdf\": \"$(base64 -w0 large.pdf)\",
@@ -252,7 +249,7 @@ curl -X POST http://localhost:8080/manipulate \
 ### Rotate Pages
 
 ```bash
-curl -X POST http://localhost:8080/manipulate \
+  curl -X POST http://localhost:8080/manipulate \
   -d "{
     \"operation\": \"rotate\",
     \"pdf\": \"...\",
@@ -263,7 +260,7 @@ curl -X POST http://localhost:8080/manipulate \
 ### PDF to Images
 
 ```bash
-curl -X POST http://localhost:8080/manipulate \
+  curl -X POST http://localhost:8080/manipulate \
   -d "{
     \"operation\": \"to_images\",
     \"pdf\": \"...\",
@@ -278,7 +275,7 @@ curl -X POST http://localhost:8080/manipulate \
 Process in background with webhook callback:
 
 ```bash
-curl -X POST http://localhost:8080/async \
+  curl -X POST http://localhost:8080/async \
   -H "Content-Type: application/json" \
   -d '{
     "request": {
@@ -320,7 +317,7 @@ curl -X POST http://localhost:8080/async \
 ## 📦 Batch Processing
 
 ```bash
-curl -X POST http://localhost:8080/batch \
+  curl -X POST http://localhost:8080/batch \
   -H "Content-Type: application/json" \
   -d '{
     "requests": [
@@ -369,10 +366,10 @@ curl -X POST http://localhost:8080/batch \
 ## 📊 Monitoring
 
 ```bash
-# Health
+  # Health
 curl http://localhost:8080/health
 
-# Prometheus metrics
+  # Prometheus metrics
 curl http://localhost:8080/metrics
 ```
 
@@ -383,16 +380,16 @@ curl http://localhost:8080/metrics
 ### Docker Compose
 
 ```bash
-docker-compose up -d
+  docker-compose up -d
 ```
 
 ### Build from Source
 
 ```bash
-git clone https://github.com/yourusername/pdf-forge.git
-cd pdf-forge
-make build
-./bin/pdf-forge
+  git clone https://github.com/yourusername/pdf-forge.git
+  cd pdf-forge
+  make build
+  ./bin/pdf-forge
 ```
 
 ---
