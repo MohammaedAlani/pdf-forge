@@ -140,7 +140,7 @@ type ConversionRequest struct {
 
 	// For HTML conversion
 	HTML     string `json:"html,omitempty"`
-	IsBase64 bool   `json:"is_base64,omitempty"`
+	IsBase64 bool   `json:"is_base64,omitempty"` // Flag to handle Base64 input
 
 	// For URL conversion
 	URL string `json:"url,omitempty"`
@@ -209,20 +209,20 @@ type PDFInfo struct {
 
 // TemplateRequest for template-based PDF generation
 type TemplateRequest struct {
-	Template   string                 `json:"template"`   // invoice, receipt, certificate, report, contract, custom
+	Template   string                 `json:"template"`              // invoice, receipt, certificate, report, contract, custom
 	CustomHTML string                 `json:"custom_html,omitempty"` // For custom template
-	Data       map[string]interface{} `json:"data"`       // Template variables
+	Data       map[string]interface{} `json:"data"`                  // Template variables
 	Options    *PDFOptions            `json:"options,omitempty"`
 }
 
 // WebhookConfig for async processing callbacks
 type WebhookConfig struct {
-	URL         string            `json:"url"`
-	Method      string            `json:"method,omitempty"` // POST (default), PUT
-	Headers     map[string]string `json:"headers,omitempty"`
-	Secret      string            `json:"secret,omitempty"` // For HMAC signature
-	RetryCount  int               `json:"retry_count,omitempty"`
-	IncludePDF  bool              `json:"include_pdf,omitempty"` // Include PDF in webhook (base64)
+	URL        string            `json:"url"`
+	Method     string            `json:"method,omitempty"` // POST (default), PUT
+	Headers    map[string]string `json:"headers,omitempty"`
+	Secret     string            `json:"secret,omitempty"` // For HMAC signature
+	RetryCount int               `json:"retry_count,omitempty"`
+	IncludePDF bool              `json:"include_pdf,omitempty"` // Include PDF in webhook (base64)
 }
 
 // AsyncRequest for background processing
@@ -241,7 +241,7 @@ type StorageConfig struct {
 	ContentType string            `json:"content_type,omitempty"`
 	ACL         string            `json:"acl,omitempty"` // private, public-read
 	Metadata    map[string]string `json:"metadata,omitempty"`
-	
+
 	// S3-specific
 	Region          string `json:"region,omitempty"`
 	AccessKeyID     string `json:"access_key_id,omitempty"`
@@ -260,8 +260,8 @@ type StorageResult struct {
 
 // ManipulateRequest for PDF manipulation operations
 type ManipulateRequest struct {
-	Operation string      `json:"operation"` // split, extract, rotate, compress, info, remove, reorder, to_images
-	PDF       string      `json:"pdf"`       // Base64 encoded PDF
+	Operation string             `json:"operation"` // split, extract, rotate, compress, info, remove, reorder, to_images
+	PDF       string             `json:"pdf"`       // Base64 encoded PDF
 	Options   *ManipulateOptions `json:"options,omitempty"`
 }
 
@@ -270,19 +270,19 @@ type ManipulateOptions struct {
 	// For split
 	SplitType string `json:"split_type,omitempty"` // all, range, every_n
 	EveryN    int    `json:"every_n,omitempty"`
-	
+
 	// For extract, remove, rotate
 	Pages string `json:"pages,omitempty"` // "1-3,5,7-9"
-	
+
 	// For rotate
 	Rotation int `json:"rotation,omitempty"` // 90, 180, 270
-	
+
 	// For compress
 	CompressionLevel string `json:"compression_level,omitempty"` // screen, ebook, printer, prepress
-	
+
 	// For reorder
 	NewOrder []int `json:"new_order,omitempty"`
-	
+
 	// For to_images
 	ImageFormat string `json:"image_format,omitempty"` // jpeg, png
 	DPI         int    `json:"dpi,omitempty"`
@@ -290,20 +290,20 @@ type ManipulateOptions struct {
 
 // ManipulateResult contains operation result
 type ManipulateResult struct {
-	Operation string   `json:"operation"`
-	Success   bool     `json:"success"`
-	Message   string   `json:"message,omitempty"`
-	
+	Operation string `json:"operation"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message,omitempty"`
+
 	// For single PDF output
 	PDF string `json:"pdf,omitempty"` // Base64 encoded
-	
+
 	// For multiple outputs (split, to_images)
 	Files []string `json:"files,omitempty"` // Base64 encoded
 	Count int      `json:"count,omitempty"`
-	
+
 	// For info operation
 	Info *PDFInfo `json:"info,omitempty"`
-	
+
 	// For compress
 	OriginalSize   int64 `json:"original_size,omitempty"`
 	CompressedSize int64 `json:"compressed_size,omitempty"`
@@ -319,12 +319,12 @@ type BatchRequest struct {
 
 // BatchResult contains batch processing results
 type BatchResult struct {
-	RequestID string          `json:"request_id"`
-	Total     int             `json:"total"`
-	Completed int             `json:"completed"`
-	Failed    int             `json:"failed"`
+	RequestID string            `json:"request_id"`
+	Total     int               `json:"total"`
+	Completed int               `json:"completed"`
+	Failed    int               `json:"failed"`
 	Results   []BatchItemResult `json:"results,omitempty"`
-	MergedPDF string          `json:"merged_pdf,omitempty"` // Base64 if merge=true
+	MergedPDF string            `json:"merged_pdf,omitempty"` // Base64 if merge=true
 }
 
 // BatchItemResult for individual batch item
