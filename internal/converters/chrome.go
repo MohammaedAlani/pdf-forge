@@ -124,136 +124,68 @@ func (c *ChromeConverter) releaseWorker() {
 
 // ConvertHTML converts HTML content to PDF
 func (c *ChromeConverter) ConvertHTML(ctx context.Context, html string, opts *models.PDFOptions) ([]byte, error) {
-	c.acquireWorker()
-	defer c.releaseWorker()
+	c.semaphore <- struct{}{}
+	defer func() { <-c.semaphore }()
 
-	if opts == nil {
-		defaults := models.DefaultOptions()
-		opts = &defaults
-	}
-
-	chromeCtx, cancel := chromedp.NewContext(c.allocCtx)
+	taskCtx, cancel := chromedp.NewContext(c.allocCtx)
 	defer cancel()
 
-	chromeCtx, cancel = context.WithTimeout(chromeCtx, 120*time.Second)
+	// Increase total timeout to allow for network loads
+	taskCtx, cancel = context.WithTimeout(taskCtx, 60*time.Second)
 	defer cancel()
 
-	var pdf []byte
+	var buf []byte
 
-	// Enhanced wait logic
-	waiterJS := `
-		new Promise((resolve) => {
-			if (document.readyState === 'complete') {
-				resolve();
-			} else {
-				window.addEventListener('load', resolve);
-			}
-		}).then(() => {
-			return document.fonts.ready;
-		}).then(() => {
-			return new Promise(r => setTimeout(r, 100));
-		});
-	`
-
-	// Get page dimensions
-	dims := opts.PageSize.GetDimensions()
-	if opts.CustomDimensions != nil && opts.PageSize == models.PageCustom {
-		dims = *opts.CustomDimensions
+	// Setup dimensions
+	width, height := 8.27, 11.69 // A4
+	if opts != nil && opts.PageSize == "Letter" {
+		width, height = 8.5, 11
+	}
+	if opts != nil && opts.Orientation == "landscape" {
+		width, height = height, width
 	}
 
-	// Swap for landscape
-	if opts.Orientation == models.Landscape {
-		dims.Width, dims.Height = dims.Height, dims.Width
-	}
-
-	// Get margins
-	margins := models.DefaultMargins()
-	if opts.Margins != nil {
-		margins = *opts.Margins
-	}
-
-	// Scale
-	scale := opts.Scale
-	if scale <= 0 || scale > 2 {
-		scale = 1.0
-	}
-
-	// Build header/footer template if provided
-	var headerTemplate, footerTemplate string
-	displayHeaderFooter := false
-	if opts.HeaderFooter != nil {
-		displayHeaderFooter = true
-		fontSize := opts.HeaderFooter.FontSize
-		if fontSize <= 0 {
-			fontSize = 10
-		}
-
-		headerTemplate = fmt.Sprintf(`
-			<div style="font-size:%fpx; width:100%%; display:flex; justify-content:space-between; padding:0 10px;">
-				<span>%s</span>
-				<span>%s</span>
-				<span>%s</span>
-			</div>`,
-			fontSize,
-			opts.HeaderFooter.HeaderLeft,
-			opts.HeaderFooter.HeaderCenter,
-			opts.HeaderFooter.HeaderRight,
-		)
-
-		footerTemplate = fmt.Sprintf(`
-			<div style="font-size:%fpx; width:100%%; display:flex; justify-content:space-between; padding:0 10px;">
-				<span>%s</span>
-				<span>%s</span>
-				<span>%s</span>
-			</div>`,
-			fontSize,
-			opts.HeaderFooter.FooterLeft,
-			opts.HeaderFooter.FooterCenter,
-			opts.HeaderFooter.FooterRight,
-		)
-	}
-
-	err := chromedp.Run(chromeCtx,
+	err := chromedp.Run(taskCtx,
 		chromedp.Navigate("about:blank"),
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			tree, err := page.GetFrameTree().Do(ctx)
+			frameTree, err := page.GetFrameTree().Do(ctx)
 			if err != nil {
 				return err
 			}
-			return page.SetDocumentContent(tree.Frame.ID, html).Do(ctx)
+			return page.SetDocumentContent(frameTree.Frame.ID, html).Do(ctx)
 		}),
-		chromedp.Evaluate(waiterJS, nil),
+		// 1. Wait for the body to be technically present
+		chromedp.WaitReady("body"),
+		// 2. Wait explicitly for external scripts (Tailwind/Fonts) to render
+		chromedp.Sleep(3*time.Second),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			printParams := page.PrintToPDF().
-				WithPrintBackground(opts.PrintBackground).
-				WithPaperWidth(dims.Width).
-				WithPaperHeight(dims.Height).
-				WithMarginTop(margins.Top).
-				WithMarginBottom(margins.Bottom).
-				WithMarginLeft(margins.Left).
-				WithMarginRight(margins.Right).
-				WithScale(scale).
-				WithDisplayHeaderFooter(displayHeaderFooter)
+				WithPaperWidth(width).
+				WithPaperHeight(height).
+				WithPrintBackground(true)
 
-			if displayHeaderFooter {
+			if opts != nil && opts.Margins != nil {
 				printParams = printParams.
-					WithHeaderTemplate(headerTemplate).
-					WithFooterTemplate(footerTemplate)
+					WithMarginTop(opts.Margins.Top).
+					WithMarginBottom(opts.Margins.Bottom).
+					WithMarginLeft(opts.Margins.Left).
+					WithMarginRight(opts.Margins.Right)
+			} else {
+				// Ensure no margins if not specified to prevent cutting off design
+				printParams = printParams.
+					WithMarginTop(0).
+					WithMarginBottom(0).
+					WithMarginLeft(0).
+					WithMarginRight(0)
 			}
 
-			buf, _, err := printParams.Do(ctx)
-			pdf = buf
+			var err error
+			buf, _, err = printParams.Do(ctx)
 			return err
 		}),
 	)
 
-	c.incrementMetric("html", err == nil)
-
-	if err != nil {
-		return nil, fmt.Errorf("HTML conversion failed: %w", err)
-	}
-
-	return pdf, nil
+	return buf, err
 }
 
 // ConvertURL converts a URL to PDF
