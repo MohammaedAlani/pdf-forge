@@ -1,0 +1,127 @@
+# =============================================================================
+# PDF Forge - Production Docker Compose
+# =============================================================================
+# 
+# Usage:
+#   1. Copy this file to docker-compose.yml
+#   2. Create a .env file with your settings (see .env.example)
+#   3. Run: docker-compose up -d
+#
+# =============================================================================
+
+services:
+  pdf-forge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pdf-forge:latest
+    container_name: pdf-forge
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    
+    environment:
+      # ===================
+      # Security Settings
+      # ===================
+      # API Key - Set this to secure your API!
+      - API_KEY=${API_KEY:-}
+      
+      # ===================
+      # Performance Settings  
+      # ===================
+      # Number of concurrent PDF workers (adjust based on CPU/RAM)
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+      
+      # Maximum request body size in bytes (default: 500MB)
+      - MAX_BODY_SIZE=${MAX_BODY_SIZE:-524288000}
+      
+      # ===================
+      # Rate Limiting
+      # ===================
+      # Requests per minute per IP (0 = disabled)
+      - RATE_LIMIT=${RATE_LIMIT:-0}
+      
+      # ===================
+      # CORS Settings
+      # ===================
+      # Comma-separated list of allowed origins, or * for all
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
+      
+      # ===================
+      # Timeout Settings (seconds)
+      # ===================
+      - READ_TIMEOUT=${READ_TIMEOUT:-300}
+      - WRITE_TIMEOUT=${WRITE_TIMEOUT:-300}
+      
+      # ===================
+      # Logging
+      # ===================
+      # Log level: debug, info, warn, error
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      
+      # ===================
+      # Server
+      # ===================
+      - ADDRESS=:8080
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '${CPU_LIMIT:-2}'
+          memory: ${MEMORY_LIMIT:-2G}
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    
+    # Temp storage for PDF processing
+    tmpfs:
+      - /tmp:size=500M
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# =============================================================================
+# Optional Services (uncomment to enable)
+# =============================================================================
+
+#   # Nginx reverse proxy with SSL
+#   nginx:
+#     image: nginx:alpine
+#     container_name: pdf-forge-nginx
+#     ports:
+#       - "443:443"
+#       - "80:80"
+#     volumes:
+#       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+#       - ./certs:/etc/nginx/certs:ro
+#     depends_on:
+#       - pdf-forge
+#     restart: unless-stopped
+
+#   # Redis for caching (future feature)
+#   redis:
+#     image: redis:alpine
+#     container_name: pdf-forge-redis
+#     restart: unless-stopped
+
+networks:
+  default:
+    name: pdf-forge-network

@@ -1,0 +1,3 @@
+github.com/chromedp/cdproto v0.0.0-20241022234722-4d5d5faf59fb/go.mod h1:4XqMl3iIW08jtieURWL6Tt5924w21pxirC6th662XUM=
+github.com/chromedp/chromedp v0.11.2/go.mod h1:lr8dFRLKsdTTWb75C/Ttol2vnBKOSnt0BW8R9Xaupi8=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=

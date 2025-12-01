@@ -1,0 +1,655 @@
+openapi: 3.0.3
+info:
+  title: PDF Forge API
+  description: |
+    High-Performance PDF Conversion Microservice
+    
+    ## Features
+    - Convert HTML, URLs, Images, and Markdown to PDF
+    - Password protection and encryption
+    - PDF manipulation (split, merge, rotate, compress)
+    - Template-based generation (invoices, certificates, reports)
+    - Async processing with webhooks
+    - Cloud storage integration (S3-compatible)
+    
+    ## Authentication
+    All endpoints (except health checks) require API key authentication via the `X-API-Key` header.
+  version: 2.0.0
+  contact:
+    name: PDF Forge Support
+    url: https://github.com/yourusername/pdf-forge
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://api.yourservice.com
+    description: Production
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Conversion
+    description: PDF conversion operations
+  - name: Manipulation
+    description: PDF manipulation operations
+  - name: Templates
+    description: Template-based PDF generation
+  - name: System
+    description: Health and status endpoints
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics
+      security: []
+      responses:
+        '200':
+          description: Prometheus-formatted metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /convert:
+    post:
+      tags: [Conversion]
+      summary: Universal conversion endpoint
+      description: Convert various formats to PDF
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConversionRequest'
+      responses:
+        '200':
+          description: PDF generated successfully
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /html:
+    post:
+      tags: [Conversion]
+      summary: Convert HTML to PDF
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                html:
+                  type: string
+                  description: HTML content
+                is_base64:
+                  type: boolean
+                  description: Whether HTML is Base64 encoded
+                options:
+                  $ref: '#/components/schemas/PDFOptions'
+              required: [html]
+          text/html:
+            schema:
+              type: string
+      responses:
+        '200':
+          $ref: '#/components/responses/PDFResponse'
+
+  /url:
+    post:
+      tags: [Conversion]
+      summary: Convert URL to PDF
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                  format: uri
+                options:
+                  $ref: '#/components/schemas/PDFOptions'
+              required: [url]
+      responses:
+        '200':
+          $ref: '#/components/responses/PDFResponse'
+
+  /image:
+    post:
+      tags: [Conversion]
+      summary: Convert image(s) to PDF
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                image:
+                  type: string
+                  description: Base64 encoded image
+                images:
+                  type: array
+                  items:
+                    type: string
+                  description: Array of Base64 encoded images
+                options:
+                  $ref: '#/components/schemas/PDFOptions'
+      responses:
+        '200':
+          $ref: '#/components/responses/PDFResponse'
+
+  /markdown:
+    post:
+      tags: [Conversion]
+      summary: Convert Markdown to PDF
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                markdown:
+                  type: string
+                options:
+                  $ref: '#/components/schemas/PDFOptions'
+              required: [markdown]
+      responses:
+        '200':
+          $ref: '#/components/responses/PDFResponse'
+
+  /merge:
+    post:
+      tags: [Manipulation]
+      summary: Merge multiple PDFs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pdfs:
+                  type: array
+                  items:
+                    type: string
+                  description: Array of Base64 encoded PDFs
+                  minItems: 2
+                options:
+                  $ref: '#/components/schemas/PDFOptions'
+              required: [pdfs]
+      responses:
+        '200':
+          $ref: '#/components/responses/PDFResponse'
+
+  /manipulate:
+    post:
+      tags: [Manipulation]
+      summary: PDF manipulation operations
+      description: |
+        Perform various PDF manipulation operations:
+        - **split**: Split PDF into individual pages or chunks
+        - **extract**: Extract specific pages
+        - **rotate**: Rotate pages
+        - **compress**: Optimize file size
+        - **info**: Get PDF metadata
+        - **remove**: Remove specific pages
+        - **reorder**: Reorder pages
+        - **to_images**: Convert to images
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManipulateRequest'
+      responses:
+        '200':
+          description: Operation completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManipulateResult'
+
+  /template:
+    post:
+      tags: [Templates]
+      summary: Generate PDF from template
+      description: |
+        Available templates:
+        - **invoice**: Professional invoice
+        - **receipt**: Point of sale receipt
+        - **certificate**: Award/completion certificate
+        - **report**: Business report
+        - **contract**: Legal contract
+        - **custom**: Your own HTML template with variables
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TemplateRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/PDFResponse'
+
+  /async:
+    post:
+      tags: [Conversion]
+      summary: Async conversion with webhook
+      description: Process conversion in background and send result to webhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AsyncRequest'
+      responses:
+        '202':
+          description: Request accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [queued]
+                  message:
+                    type: string
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    ConversionRequest:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [html, url, image, images, markdown, merge]
+        html:
+          type: string
+        is_base64:
+          type: boolean
+        url:
+          type: string
+        image:
+          type: string
+        images:
+          type: array
+          items:
+            type: string
+        markdown:
+          type: string
+        pdfs:
+          type: array
+          items:
+            type: string
+        options:
+          $ref: '#/components/schemas/PDFOptions'
+      required: [type]
+
+    PDFOptions:
+      type: object
+      properties:
+        page_size:
+          type: string
+          enum: [A4, A3, Letter, Legal, Tabloid, Custom]
+          default: A4
+        custom_dimensions:
+          type: object
+          properties:
+            width:
+              type: number
+            height:
+              type: number
+        orientation:
+          type: string
+          enum: [portrait, landscape]
+          default: portrait
+        margins:
+          type: object
+          properties:
+            top:
+              type: number
+            bottom:
+              type: number
+            left:
+              type: number
+            right:
+              type: number
+        print_background:
+          type: boolean
+          default: true
+        scale:
+          type: number
+          minimum: 0.1
+          maximum: 2.0
+          default: 1.0
+        grayscale:
+          type: boolean
+        security:
+          $ref: '#/components/schemas/PDFSecurity'
+        metadata:
+          $ref: '#/components/schemas/PDFMetadata'
+        header_footer:
+          $ref: '#/components/schemas/HeaderFooter'
+
+    PDFSecurity:
+      type: object
+      properties:
+        user_password:
+          type: string
+          description: Password required to open PDF
+        owner_password:
+          type: string
+          description: Password for full access
+        allow_printing:
+          type: boolean
+          default: true
+        allow_copying:
+          type: boolean
+          default: true
+        allow_modifying:
+          type: boolean
+          default: false
+        encryption_bits:
+          type: integer
+          enum: [128, 256]
+          default: 256
+
+    PDFMetadata:
+      type: object
+      properties:
+        title:
+          type: string
+        author:
+          type: string
+        subject:
+          type: string
+        keywords:
+          type: string
+        creator:
+          type: string
+
+    HeaderFooter:
+      type: object
+      properties:
+        header_left:
+          type: string
+        header_center:
+          type: string
+        header_right:
+          type: string
+        footer_left:
+          type: string
+        footer_center:
+          type: string
+        footer_right:
+          type: string
+        font_size:
+          type: number
+
+    ManipulateRequest:
+      type: object
+      properties:
+        operation:
+          type: string
+          enum: [split, extract, rotate, compress, info, remove, reorder, to_images]
+        pdf:
+          type: string
+          description: Base64 encoded PDF
+        options:
+          type: object
+          properties:
+            split_type:
+              type: string
+              enum: [all, range, every_n]
+            every_n:
+              type: integer
+            pages:
+              type: string
+              description: "Page range (e.g., '1-3,5,7-9')"
+            rotation:
+              type: integer
+              enum: [90, 180, 270]
+            compression_level:
+              type: string
+              enum: [screen, ebook, printer, prepress]
+            new_order:
+              type: array
+              items:
+                type: integer
+            image_format:
+              type: string
+              enum: [jpeg, png]
+            dpi:
+              type: integer
+      required: [operation, pdf]
+
+    ManipulateResult:
+      type: object
+      properties:
+        operation:
+          type: string
+        success:
+          type: boolean
+        message:
+          type: string
+        pdf:
+          type: string
+          description: Base64 encoded result PDF
+        files:
+          type: array
+          items:
+            type: string
+          description: Base64 encoded files (for split/to_images)
+        count:
+          type: integer
+        info:
+          $ref: '#/components/schemas/PDFInfo'
+        original_size:
+          type: integer
+        compressed_size:
+          type: integer
+        savings_percent:
+          type: integer
+
+    PDFInfo:
+      type: object
+      properties:
+        title:
+          type: string
+        author:
+          type: string
+        page_count:
+          type: integer
+        page_size:
+          type: string
+        pdf_version:
+          type: string
+        encrypted:
+          type: boolean
+        file_size:
+          type: integer
+
+    TemplateRequest:
+      type: object
+      properties:
+        template:
+          type: string
+          enum: [invoice, receipt, certificate, report, contract, custom]
+        custom_html:
+          type: string
+          description: Custom template HTML (required if template is 'custom')
+        data:
+          type: object
+          description: Template variables
+        options:
+          $ref: '#/components/schemas/PDFOptions'
+      required: [template, data]
+
+    AsyncRequest:
+      type: object
+      properties:
+        request:
+          $ref: '#/components/schemas/ConversionRequest'
+        webhook:
+          $ref: '#/components/schemas/WebhookConfig'
+        storage:
+          $ref: '#/components/schemas/StorageConfig'
+      required: [request]
+
+    WebhookConfig:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        method:
+          type: string
+          enum: [POST, PUT]
+          default: POST
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        secret:
+          type: string
+          description: Secret for HMAC signature
+        retry_count:
+          type: integer
+          default: 3
+        include_pdf:
+          type: boolean
+          description: Include PDF in webhook payload (base64)
+      required: [url]
+
+    StorageConfig:
+      type: object
+      properties:
+        provider:
+          type: string
+          enum: [s3, local]
+        bucket:
+          type: string
+        path:
+          type: string
+        filename:
+          type: string
+        acl:
+          type: string
+          enum: [private, public-read]
+        region:
+          type: string
+        access_key_id:
+          type: string
+        secret_access_key:
+          type: string
+        endpoint:
+          type: string
+          description: Custom endpoint for S3-compatible storage
+      required: [provider, bucket, path]
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        version:
+          type: string
+        uptime:
+          type: string
+        workers:
+          type: object
+          properties:
+            max:
+              type: integer
+            available:
+              type: integer
+            in_use:
+              type: integer
+        chrome:
+          type: string
+        conversions:
+          type: object
+          properties:
+            total:
+              type: integer
+            successful:
+              type: integer
+            failed:
+              type: integer
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+
+  responses:
+    PDFResponse:
+      description: PDF generated successfully
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+        Content-Length:
+          schema:
+            type: integer
+      content:
+        application/pdf:
+          schema:
+            type: string
+            format: binary
+
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
