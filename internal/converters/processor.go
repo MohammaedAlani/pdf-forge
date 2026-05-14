@@ -9,92 +9,91 @@ import (
 	"path/filepath"
 
 	"pdf-forge/internal/models"
+
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
-// PDFProcessor handles post-processing of PDFs (security, watermarks, etc.)
+// PDFProcessor handles post-processing of PDFs (security, watermarks, metadata).
 type PDFProcessor struct {
-	tempDir string
+	baseDir string
 }
 
-// NewPDFProcessor creates a new processor
+// NewPDFProcessor creates a new processor.
 func NewPDFProcessor() (*PDFProcessor, error) {
-	tempDir, err := os.MkdirTemp("", "pdfforge-*")
+	baseDir, err := os.MkdirTemp("", "pdfforge-proc-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
-
-	return &PDFProcessor{tempDir: tempDir}, nil
+	return &PDFProcessor{baseDir: baseDir}, nil
 }
 
-// Close cleans up temporary files
+// Close cleans up temporary files.
 func (p *PDFProcessor) Close() error {
-	return os.RemoveAll(p.tempDir)
+	return os.RemoveAll(p.baseDir)
 }
 
-// ApplySecurity applies password protection to a PDF using qpdf
+func (p *PDFProcessor) scratch(op string) (string, func(), error) {
+	dir, err := os.MkdirTemp(p.baseDir, op+"-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create scratch dir: %w", err)
+	}
+	return dir, func() { _ = os.RemoveAll(dir) }, nil
+}
+
+// ApplySecurity applies password protection to a PDF using qpdf.
 func (p *PDFProcessor) ApplySecurity(pdfData []byte, security *models.PDFSecurity) ([]byte, error) {
 	if security == nil {
 		return pdfData, nil
 	}
-
 	if security.UserPassword == "" && security.OwnerPassword == "" {
 		return pdfData, nil
 	}
 
-	// Write input PDF to temp file
-	inputPath := filepath.Join(p.tempDir, "input.pdf")
-	outputPath := filepath.Join(p.tempDir, "output.pdf")
+	dir, cleanup, err := p.scratch("encrypt")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdfData, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPath := filepath.Join(dir, "output.pdf")
+
+	if err := os.WriteFile(inputPath, pdfData, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write temp file: %w", err)
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
 
-	// Build qpdf command for encryption
 	args := []string{
 		"--encrypt",
 		security.UserPassword,
 		security.OwnerPassword,
 	}
 
-	// Set key length (128 or 256 bit)
 	keyBits := security.EncryptionBits
 	if keyBits != 128 && keyBits != 256 {
-		keyBits = 256 // Default to 256-bit
+		keyBits = 256
 	}
 
 	if keyBits == 256 {
 		args = append(args, "256")
+		if security.AllowPrinting {
+			args = append(args, "--print=full")
+		} else {
+			args = append(args, "--print=none")
+		}
+		if security.AllowModifying {
+			args = append(args, "--modify=all")
+		} else {
+			args = append(args, "--modify=none")
+		}
+		if security.AllowCopying {
+			args = append(args, "--extract=y")
+		} else {
+			args = append(args, "--extract=n")
+		}
 	} else {
 		args = append(args, "128")
-	}
-
-	// Set permissions for 256-bit encryption
-	if keyBits == 256 {
-		// Build permissions string
-		permissions := []string{}
-		if security.AllowPrinting {
-			permissions = append(permissions, "--print=full")
-		} else {
-			permissions = append(permissions, "--print=none")
-		}
-
-		if security.AllowModifying {
-			permissions = append(permissions, "--modify=all")
-		} else {
-			permissions = append(permissions, "--modify=none")
-		}
-
-		if security.AllowCopying {
-			permissions = append(permissions, "--extract=y")
-		} else {
-			permissions = append(permissions, "--extract=n")
-		}
-
-		args = append(args, permissions...)
-	} else {
-		// 128-bit permissions
 		if !security.AllowPrinting {
 			args = append(args, "--print=n")
 		}
@@ -111,7 +110,6 @@ func (p *PDFProcessor) ApplySecurity(pdfData []byte, security *models.PDFSecurit
 	cmd := exec.Command("qpdf", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("qpdf encryption failed: %w - %s", err, stderr.String())
 	}
@@ -119,118 +117,111 @@ func (p *PDFProcessor) ApplySecurity(pdfData []byte, security *models.PDFSecurit
 	return os.ReadFile(outputPath)
 }
 
-// ApplyWatermark applies a text watermark to PDF pages
-func (p *PDFProcessor) ApplyWatermark(pdfData []byte, watermark *models.Watermark) ([]byte, error) {
-	if watermark == nil || watermark.Text == "" {
+// ApplyWatermark applies a text watermark to PDF pages using pdfcpu.
+func (p *PDFProcessor) ApplyWatermark(pdfData []byte, w *models.Watermark) ([]byte, error) {
+	if w == nil || w.Text == "" {
 		return pdfData, nil
 	}
 
-	// Write input PDF
-	inputPath := filepath.Join(p.tempDir, "input_wm.pdf")
-	outputPath := filepath.Join(p.tempDir, "output_wm.pdf")
-
-	if err := os.WriteFile(inputPath, pdfData, 0644); err != nil {
-		return nil, fmt.Errorf("failed to write temp file: %w", err)
-	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
-
-	// Set defaults
-	fontSize := watermark.FontSize
+	fontSize := w.FontSize
 	if fontSize <= 0 {
 		fontSize = 48
 	}
-
-	opacity := watermark.Opacity
+	opacity := w.Opacity
 	if opacity <= 0 || opacity > 1 {
 		opacity = 0.3
 	}
-
-	rotation := watermark.Rotation
+	rotation := w.Rotation
 	if rotation == 0 {
 		rotation = 45
 	}
-
-	color := watermark.Color
+	color := w.Color
 	if color == "" {
-		color = "gray"
+		color = "0.5 0.5 0.5" // gray in pdfcpu RGB-fraction syntax
 	}
 
-	// Build watermark specification for qpdf
-	// Note: qpdf doesn't directly support watermarks, so we use an alternative approach
-	// For production, consider using pdfcpu or a dedicated watermarking library
+	desc := fmt.Sprintf(
+		"font:Helvetica, points:%.0f, opacity:%.2f, rotation:%.0f, color:%s, scale:1.0 abs, pos:c",
+		fontSize, opacity, rotation, color,
+	)
 
-	// Fallback: copy original for now
-	// In production, integrate pdfcpu or pdftk for watermarking
-	return pdfData, nil
+	wm, err := api.TextWatermark(w.Text, desc, true, false, types.POINTS)
+	if err != nil {
+		return nil, fmt.Errorf("watermark setup failed: %w", err)
+	}
+
+	var out bytes.Buffer
+	if err := api.AddWatermarks(bytes.NewReader(pdfData), &out, nil, wm, model.NewDefaultConfiguration()); err != nil {
+		return nil, fmt.Errorf("watermark apply failed: %w", err)
+	}
+	return out.Bytes(), nil
 }
 
-// SetMetadata sets PDF metadata
-func (p *PDFProcessor) SetMetadata(pdfData []byte, metadata *models.PDFMetadata) ([]byte, error) {
-	if metadata == nil {
+// SetMetadata sets PDF document properties (Title/Author/Subject/Keywords/Creator) via pdfcpu.
+func (p *PDFProcessor) SetMetadata(pdfData []byte, m *models.PDFMetadata) ([]byte, error) {
+	if m == nil {
 		return pdfData, nil
 	}
 
-	// Write input PDF
-	inputPath := filepath.Join(p.tempDir, "input_meta.pdf")
-	outputPath := filepath.Join(p.tempDir, "output_meta.pdf")
-
-	if err := os.WriteFile(inputPath, pdfData, 0644); err != nil {
-		return nil, fmt.Errorf("failed to write temp file: %w", err)
+	props := map[string]string{}
+	if m.Title != "" {
+		props["Title"] = m.Title
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
-
-	// Use exiftool or qpdf for metadata
-	// qpdf can preserve but not set metadata directly
-	// For production, use pdfcpu API or pikepdf
-
-	args := []string{"--linearize", inputPath, outputPath}
-	cmd := exec.Command("qpdf", args...)
-
-	if err := cmd.Run(); err != nil {
-		// If qpdf fails, return original
+	if m.Author != "" {
+		props["Author"] = m.Author
+	}
+	if m.Subject != "" {
+		props["Subject"] = m.Subject
+	}
+	if m.Keywords != "" {
+		props["Keywords"] = m.Keywords
+	}
+	if m.Creator != "" {
+		props["Creator"] = m.Creator
+	}
+	if len(props) == 0 {
 		return pdfData, nil
 	}
 
-	return os.ReadFile(outputPath)
+	var out bytes.Buffer
+	if err := api.AddProperties(bytes.NewReader(pdfData), &out, props, model.NewDefaultConfiguration()); err != nil {
+		return nil, fmt.Errorf("metadata apply failed: %w", err)
+	}
+	return out.Bytes(), nil
 }
 
-// MergePDFs merges multiple PDFs using qpdf
+// MergePDFs merges multiple PDFs using qpdf.
 func (p *PDFProcessor) MergePDFs(pdfs [][]byte) ([]byte, error) {
 	if len(pdfs) == 0 {
 		return nil, fmt.Errorf("no PDFs provided for merge")
 	}
-
 	if len(pdfs) == 1 {
 		return pdfs[0], nil
 	}
 
-	// Write all PDFs to temp files
-	var inputPaths []string
+	dir, cleanup, err := p.scratch("merge")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	inputPaths := make([]string, 0, len(pdfs))
 	for i, pdf := range pdfs {
-		path := filepath.Join(p.tempDir, fmt.Sprintf("merge_%d.pdf", i))
-		if err := os.WriteFile(path, pdf, 0644); err != nil {
-			return nil, fmt.Errorf("failed to write temp file %d: %w", i, err)
+		path := filepath.Join(dir, fmt.Sprintf("part_%d.pdf", i))
+		if err := os.WriteFile(path, pdf, 0o644); err != nil {
+			return nil, fmt.Errorf("failed to write part %d: %w", i, err)
 		}
 		inputPaths = append(inputPaths, path)
-		defer os.Remove(path)
 	}
 
-	outputPath := filepath.Join(p.tempDir, "merged.pdf")
-	defer os.Remove(outputPath)
-
-	// Build qpdf merge command
+	outputPath := filepath.Join(dir, "merged.pdf")
 	args := []string{"--empty", "--pages"}
-	for _, path := range inputPaths {
-		args = append(args, path)
-	}
+	args = append(args, inputPaths...)
 	args = append(args, "--", outputPath)
 
 	cmd := exec.Command("qpdf", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("PDF merge failed: %w - %s", err, stderr.String())
 	}
@@ -238,22 +229,25 @@ func (p *PDFProcessor) MergePDFs(pdfs [][]byte) ([]byte, error) {
 	return os.ReadFile(outputPath)
 }
 
-// CompressPDF optimizes PDF file size
+// CompressPDF optimizes PDF file size using Ghostscript.
 func (p *PDFProcessor) CompressPDF(pdfData []byte) ([]byte, error) {
-	inputPath := filepath.Join(p.tempDir, "input_compress.pdf")
-	outputPath := filepath.Join(p.tempDir, "output_compress.pdf")
+	dir, cleanup, err := p.scratch("compress")
+	if err != nil {
+		return pdfData, nil
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdfData, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPath := filepath.Join(dir, "output.pdf")
+
+	if err := os.WriteFile(inputPath, pdfData, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write temp file: %w", err)
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
 
-	// Use Ghostscript for compression
 	args := []string{
 		"-sDEVICE=pdfwrite",
 		"-dCompatibilityLevel=1.4",
-		"-dPDFSETTINGS=/ebook", // Good balance of quality and size
+		"-dPDFSETTINGS=/ebook",
 		"-dNOPAUSE",
 		"-dQUIET",
 		"-dBATCH",
@@ -264,9 +258,7 @@ func (p *PDFProcessor) CompressPDF(pdfData []byte) ([]byte, error) {
 	cmd := exec.Command("gs", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-
 	if err := cmd.Run(); err != nil {
-		// If compression fails, return original
 		return pdfData, nil
 	}
 
@@ -274,16 +266,14 @@ func (p *PDFProcessor) CompressPDF(pdfData []byte) ([]byte, error) {
 	if err != nil {
 		return pdfData, nil
 	}
-
-	// Only use compressed if it's actually smaller
 	if len(compressed) < len(pdfData) {
 		return compressed, nil
 	}
-
 	return pdfData, nil
 }
 
-// Process applies all post-processing to a PDF
+// Process applies the post-processing pipeline (watermark, metadata, security)
+// in an order that prevents later steps from invalidating earlier ones.
 func (p *PDFProcessor) Process(pdfData []byte, opts *models.PDFOptions) ([]byte, error) {
 	if opts == nil {
 		return pdfData, nil
@@ -291,15 +281,13 @@ func (p *PDFProcessor) Process(pdfData []byte, opts *models.PDFOptions) ([]byte,
 
 	var err error
 
-	// Apply watermark first
-	if opts.Watermark != nil {
+	if opts.Watermark != nil && opts.Watermark.Text != "" {
 		pdfData, err = p.ApplyWatermark(pdfData, opts.Watermark)
 		if err != nil {
 			return nil, fmt.Errorf("watermark failed: %w", err)
 		}
 	}
 
-	// Apply metadata
 	if opts.Metadata != nil {
 		pdfData, err = p.SetMetadata(pdfData, opts.Metadata)
 		if err != nil {
@@ -307,7 +295,7 @@ func (p *PDFProcessor) Process(pdfData []byte, opts *models.PDFOptions) ([]byte,
 		}
 	}
 
-	// Apply security last (encryption)
+	// Security must run last; encryption would block subsequent edits.
 	if opts.Security != nil {
 		pdfData, err = p.ApplySecurity(pdfData, opts.Security)
 		if err != nil {
@@ -318,18 +306,21 @@ func (p *PDFProcessor) Process(pdfData []byte, opts *models.PDFOptions) ([]byte,
 	return pdfData, nil
 }
 
-// ConvertToPDFA converts PDF to PDF/A format for archival
+// ConvertToPDFA converts PDF to PDF/A format for archival.
 func (p *PDFProcessor) ConvertToPDFA(pdfData []byte) ([]byte, error) {
-	inputPath := filepath.Join(p.tempDir, "input_pdfa.pdf")
-	outputPath := filepath.Join(p.tempDir, "output_pdfa.pdf")
+	dir, cleanup, err := p.scratch("pdfa")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdfData, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPath := filepath.Join(dir, "output.pdf")
+
+	if err := os.WriteFile(inputPath, pdfData, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write temp file: %w", err)
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
 
-	// Use Ghostscript for PDF/A conversion
 	args := []string{
 		"-dPDFA=2",
 		"-dBATCH",
@@ -349,7 +340,42 @@ func (p *PDFProcessor) ConvertToPDFA(pdfData []byte) ([]byte, error) {
 	return os.ReadFile(outputPath)
 }
 
-// StreamingCopy copies PDF data efficiently
+// AddPageNumbersWithPDFCPU stamps page numbers via pdfcpu.
+// Format defaults to "%p / %P" (e.g. "3 / 12"). Position defaults to "bottom-center".
+func AddPageNumbersWithPDFCPU(pdfData []byte, position, format string) ([]byte, error) {
+	if format == "" {
+		format = "%p / %P"
+	}
+	pos := "bc"
+	switch position {
+	case "bottom-left", "bl":
+		pos = "bl"
+	case "bottom-right", "br":
+		pos = "br"
+	case "bottom-center", "bc", "":
+		pos = "bc"
+	case "top-left", "tl":
+		pos = "tl"
+	case "top-right", "tr":
+		pos = "tr"
+	case "top-center", "tc":
+		pos = "tc"
+	}
+
+	desc := fmt.Sprintf("font:Helvetica, points:10, opacity:1.0, rotation:0, scale:1.0 abs, pos:%s", pos)
+	wm, err := api.TextWatermark(format, desc, true, false, types.POINTS)
+	if err != nil {
+		return nil, fmt.Errorf("page-number setup failed: %w", err)
+	}
+
+	var out bytes.Buffer
+	if err := api.AddWatermarks(bytes.NewReader(pdfData), &out, nil, wm, model.NewDefaultConfiguration()); err != nil {
+		return nil, fmt.Errorf("page-number stamping failed: %w", err)
+	}
+	return out.Bytes(), nil
+}
+
+// StreamingCopy copies PDF data efficiently.
 func StreamingCopy(dst io.Writer, src io.Reader) (int64, error) {
 	return io.Copy(dst, src)
 }

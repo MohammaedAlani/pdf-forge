@@ -49,6 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # PDF tools
     qpdf \
     ghostscript \
+    poppler-utils \
     # Fonts
     fonts-liberation \
     fonts-noto \
@@ -59,6 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Utils
     dumb-init \
     ca-certificates \
+    wget \
     # Cleanup
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/cache/apt/* \

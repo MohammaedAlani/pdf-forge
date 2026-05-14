@@ -9,22 +9,28 @@ import (
 	"time"
 
 	"pdf-forge/internal/converters"
+	"pdf-forge/internal/metrics"
 	"pdf-forge/internal/middleware"
 	"pdf-forge/internal/models"
 	"pdf-forge/internal/services"
 	"pdf-forge/internal/templates"
 )
 
-// ExtendedHandler adds template and manipulation handlers
+// maxConcurrentAsync caps how many /async jobs can be in flight at once.
+// Larger payloads block until a slot frees instead of forking unlimited goroutines.
+const maxConcurrentAsync = 32
+
+// ExtendedHandler adds template and manipulation handlers.
 type ExtendedHandler struct {
 	*Handler
 	templateEngine *templates.TemplateEngine
 	manipulator    *converters.PDFManipulator
 	webhookSvc     *services.WebhookService
 	storageSvc     *services.StorageService
+	asyncSlots     chan struct{}
 }
 
-// NewExtendedHandler creates an extended handler with all features
+// NewExtendedHandler creates an extended handler with all features.
 func NewExtendedHandler(h *Handler) (*ExtendedHandler, error) {
 	manipulator, err := converters.NewPDFManipulator()
 	if err != nil {
@@ -37,10 +43,11 @@ func NewExtendedHandler(h *Handler) (*ExtendedHandler, error) {
 		manipulator:    manipulator,
 		webhookSvc:     services.NewWebhookService(h.logger),
 		storageSvc:     services.NewStorageService(h.logger),
+		asyncSlots:     make(chan struct{}, maxConcurrentAsync),
 	}, nil
 }
 
-// Close releases resources
+// Close releases resources.
 func (h *ExtendedHandler) Close() error {
 	if h.manipulator != nil {
 		return h.manipulator.Close()
@@ -48,13 +55,13 @@ func (h *ExtendedHandler) Close() error {
 	return nil
 }
 
-// Template handles template-based PDF generation
+// Template handles template-based PDF generation.
 func (h *ExtendedHandler) Template(w http.ResponseWriter, r *http.Request) {
 	requestID := middleware.GetRequestID(r.Context())
 
 	var req models.TemplateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errorResponse(w, http.StatusBadRequest, "Invalid JSON payload", requestID)
+	if err := decodeJSON(r, &req); err != nil {
+		h.handleDecodeError(w, err, requestID)
 		return
 	}
 
@@ -63,10 +70,10 @@ func (h *ExtendedHandler) Template(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
 	var html string
 	var err error
 
-	// Render template
 	if req.Template == "custom" {
 		if req.CustomHTML == "" {
 			h.errorResponse(w, http.StatusBadRequest, "Custom HTML is required for custom template", requestID)
@@ -78,53 +85,44 @@ func (h *ExtendedHandler) Template(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		h.logger.Error("Template rendering failed",
-			"request_id", requestID,
-			"template", req.Template,
-			"error", err.Error(),
-		)
+		h.logger.Error("Template rendering failed", "request_id", requestID, "template", req.Template, "error", err.Error())
+		metrics.Record("template", "failure", time.Since(start).Seconds(), 0)
 		h.errorResponse(w, http.StatusBadRequest, "Template rendering failed: "+err.Error(), requestID)
 		return
 	}
 
-	// Convert to PDF
 	pdfData, err := h.converter.ConvertHTML(r.Context(), html, req.Options)
 	if err != nil {
-		h.logger.Error("PDF conversion failed",
-			"request_id", requestID,
-			"error", err.Error(),
-		)
+		h.logger.Error("PDF conversion failed", "request_id", requestID, "error", err.Error())
+		metrics.Record("template", "failure", time.Since(start).Seconds(), 0)
 		h.errorResponse(w, http.StatusInternalServerError, "PDF conversion failed: "+err.Error(), requestID)
 		return
 	}
 
-	// Apply post-processing
 	if req.Options != nil && h.processor != nil {
 		pdfData, err = h.processor.Process(pdfData, req.Options)
 		if err != nil {
+			metrics.Record("template", "failure", time.Since(start).Seconds(), 0)
 			h.errorResponse(w, http.StatusInternalServerError, "Post-processing failed: "+err.Error(), requestID)
 			return
 		}
 	}
 
-	h.logger.Info("Template PDF generated",
-		"request_id", requestID,
-		"template", req.Template,
-		"size_bytes", len(pdfData),
-	)
+	metrics.Record("template", "success", time.Since(start).Seconds(), len(pdfData))
+	h.logger.Info("Template PDF generated", "request_id", requestID, "template", req.Template, "size_bytes", len(pdfData))
 
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(pdfData)))
-	w.Write(pdfData)
+	_, _ = w.Write(pdfData)
 }
 
-// Manipulate handles PDF manipulation operations
+// Manipulate handles PDF manipulation operations.
 func (h *ExtendedHandler) Manipulate(w http.ResponseWriter, r *http.Request) {
 	requestID := middleware.GetRequestID(r.Context())
 
 	var req models.ManipulateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errorResponse(w, http.StatusBadRequest, "Invalid JSON payload", requestID)
+	if err := decodeJSON(r, &req); err != nil {
+		h.handleDecodeError(w, err, requestID)
 		return
 	}
 
@@ -133,7 +131,6 @@ func (h *ExtendedHandler) Manipulate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Decode PDF
 	pdfData, err := base64.StdEncoding.DecodeString(req.PDF)
 	if err != nil {
 		h.errorResponse(w, http.StatusBadRequest, "Invalid Base64 PDF data", requestID)
@@ -141,23 +138,24 @@ func (h *ExtendedHandler) Manipulate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	result := &models.ManipulateResult{
-		Operation: req.Operation,
-		Success:   true,
-	}
+	result := &models.ManipulateResult{Operation: req.Operation, Success: true}
+	start := time.Now()
 
 	switch req.Operation {
 	case "split":
+		opts := req.Options
+		if opts == nil {
+			opts = &models.ManipulateOptions{}
+		}
 		splitReq := &converters.SplitRequest{
 			PDF:       pdfData,
-			SplitType: req.Options.SplitType,
-			Pages:     req.Options.Pages,
-			EveryN:    req.Options.EveryN,
+			SplitType: opts.SplitType,
+			Pages:     opts.Pages,
+			EveryN:    opts.EveryN,
 		}
 		if splitReq.SplitType == "" {
 			splitReq.SplitType = "all"
 		}
-
 		splitResult, err := h.manipulator.Split(ctx, splitReq)
 		if err != nil {
 			result.Success = false
@@ -282,28 +280,49 @@ func (h *ExtendedHandler) Manipulate(w http.ResponseWriter, r *http.Request) {
 			result.Message = fmt.Sprintf("Converted to %d images", len(images))
 		}
 
+	case "page_numbers":
+		position := ""
+		format := ""
+		if req.Options != nil {
+			position = req.Options.SplitType // reuse "split_type" field as position (or read from pages)
+		}
+		stamped, err := h.manipulator.AddPageNumbers(ctx, pdfData, position, format)
+		if err != nil {
+			result.Success = false
+			result.Message = err.Error()
+		} else {
+			result.PDF = base64.StdEncoding.EncodeToString(stamped)
+			result.Message = "Page numbers added"
+		}
+
 	default:
 		h.errorResponse(w, http.StatusBadRequest, "Unknown operation: "+req.Operation, requestID)
 		return
 	}
 
-	h.logger.Info("PDF manipulation completed",
-		"request_id", requestID,
-		"operation", req.Operation,
-		"success", result.Success,
-	)
+	outcome := "success"
+	if !result.Success {
+		outcome = "failure"
+	}
+	size := 0
+	if result.PDF != "" {
+		size = len(result.PDF)
+	}
+	metrics.Record("manipulate."+req.Operation, outcome, time.Since(start).Seconds(), size)
+
+	h.logger.Info("PDF manipulation completed", "request_id", requestID, "operation", req.Operation, "success", result.Success)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
-// Async handles async conversion with webhook callback
+// Async handles async conversion with webhook callback.
 func (h *ExtendedHandler) Async(w http.ResponseWriter, r *http.Request) {
 	requestID := middleware.GetRequestID(r.Context())
 
 	var req models.AsyncRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errorResponse(w, http.StatusBadRequest, "Invalid JSON payload", requestID)
+	if err := decodeJSON(r, &req); err != nil {
+		h.handleDecodeError(w, err, requestID)
 		return
 	}
 
@@ -312,12 +331,26 @@ func (h *ExtendedHandler) Async(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process in background
-	go h.processAsync(requestID, &req)
+	// Reject if the queue is full so callers get clear back-pressure.
+	select {
+	case h.asyncSlots <- struct{}{}:
+	default:
+		h.errorResponse(w, http.StatusServiceUnavailable, "Async queue is full, retry later", requestID)
+		return
+	}
+	metrics.AsyncQueueDepth.Set(float64(len(h.asyncSlots)))
+
+	go func() {
+		defer func() {
+			<-h.asyncSlots
+			metrics.AsyncQueueDepth.Set(float64(len(h.asyncSlots)))
+		}()
+		h.processAsync(requestID, &req)
+	}()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{
+	_ = json.NewEncoder(w).Encode(map[string]string{
 		"request_id": requestID,
 		"status":     "queued",
 		"message":    "Request accepted for processing",
@@ -330,13 +363,15 @@ func (h *ExtendedHandler) processAsync(requestID string, req *models.AsyncReques
 
 	startTime := time.Now()
 	convType := string(req.Request.Type)
+	if convType == "" {
+		convType = "html"
+	}
 
-	// Perform conversion
 	var pdfData []byte
 	var err error
 
 	switch req.Request.Type {
-	case models.ConvertHTML:
+	case models.ConvertHTML, "":
 		html := req.Request.HTML
 		if req.Request.IsBase64 {
 			decoded, decErr := base64.StdEncoding.DecodeString(html)
@@ -363,18 +398,21 @@ func (h *ExtendedHandler) processAsync(requestID string, req *models.AsyncReques
 
 	duration := time.Since(startTime)
 
-	// Apply post-processing
 	if err == nil && req.Request.Options != nil && h.processor != nil {
 		pdfData, err = h.processor.Process(pdfData, req.Request.Options)
 	}
 
-	// Upload to storage if configured
 	var storageResult *models.StorageResult
 	if err == nil && req.Storage != nil {
 		storageResult, err = h.storageSvc.Upload(ctx, req.Storage, pdfData, "application/pdf")
 	}
 
-	// Send webhook if configured
+	outcome := "success"
+	if err != nil {
+		outcome = "failure"
+	}
+	metrics.Record("async."+convType, outcome, duration.Seconds(), len(pdfData))
+
 	if req.Webhook != nil {
 		var payload *services.WebhookPayload
 		if err != nil {
@@ -386,10 +424,7 @@ func (h *ExtendedHandler) processAsync(requestID string, req *models.AsyncReques
 		}
 
 		if webhookErr := h.webhookSvc.Send(ctx, req.Webhook, payload); webhookErr != nil {
-			h.logger.Error("Webhook delivery failed",
-				"request_id", requestID,
-				"error", webhookErr.Error(),
-			)
+			h.logger.Error("Webhook delivery failed", "request_id", requestID, "error", webhookErr.Error())
 		}
 	}
 
@@ -401,13 +436,13 @@ func (h *ExtendedHandler) processAsync(requestID string, req *models.AsyncReques
 	)
 }
 
-// Batch handles batch conversion requests
+// Batch handles batch conversion requests.
 func (h *ExtendedHandler) Batch(w http.ResponseWriter, r *http.Request) {
 	requestID := middleware.GetRequestID(r.Context())
 
 	var req models.BatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errorResponse(w, http.StatusBadRequest, "Invalid JSON payload", requestID)
+	if err := decodeJSON(r, &req); err != nil {
+		h.handleDecodeError(w, err, requestID)
 		return
 	}
 
@@ -429,11 +464,10 @@ func (h *ExtendedHandler) Batch(w http.ResponseWriter, r *http.Request) {
 
 		var pdfData []byte
 		var err error
-
 		ctx := r.Context()
 
 		switch convReq.Type {
-		case models.ConvertHTML:
+		case models.ConvertHTML, "":
 			html := convReq.HTML
 			if convReq.IsBase64 {
 				decoded, _ := base64.StdEncoding.DecodeString(html)
@@ -457,7 +491,6 @@ func (h *ExtendedHandler) Batch(w http.ResponseWriter, r *http.Request) {
 			itemResult.Error = err.Error()
 			result.Failed++
 		} else {
-			// Apply post-processing
 			if convReq.Options != nil && h.processor != nil {
 				pdfData, err = h.processor.Process(pdfData, convReq.Options)
 				if err != nil {
@@ -481,7 +514,6 @@ func (h *ExtendedHandler) Batch(w http.ResponseWriter, r *http.Request) {
 		result.Results = append(result.Results, itemResult)
 	}
 
-	// Merge if requested
 	if req.Merge && len(allPDFs) > 0 && h.processor != nil {
 		merged, err := h.processor.MergePDFs(allPDFs)
 		if err == nil {
@@ -497,10 +529,10 @@ func (h *ExtendedHandler) Batch(w http.ResponseWriter, r *http.Request) {
 	)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
-// TableToPDF converts table data (CSV/JSON) to PDF
+// TableToPDF converts table data (CSV/JSON) to PDF.
 func (h *ExtendedHandler) TableToPDF(w http.ResponseWriter, r *http.Request) {
 	requestID := middleware.GetRequestID(r.Context())
 
@@ -508,29 +540,35 @@ func (h *ExtendedHandler) TableToPDF(w http.ResponseWriter, r *http.Request) {
 		Data    models.TableData   `json:"data"`
 		Options *models.PDFOptions `json:"options,omitempty"`
 	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errorResponse(w, http.StatusBadRequest, "Invalid JSON payload", requestID)
+	if err := decodeJSON(r, &req); err != nil {
+		h.handleDecodeError(w, err, requestID)
 		return
 	}
 
-	// Generate HTML table
 	html := generateTableHTML(&req.Data)
 
-	// Convert to PDF
 	pdfData, err := h.converter.ConvertHTML(r.Context(), html, req.Options)
 	if err != nil {
 		h.errorResponse(w, http.StatusInternalServerError, "PDF conversion failed: "+err.Error(), requestID)
 		return
 	}
 
+	if req.Options != nil && h.processor != nil {
+		pdfData, err = h.processor.Process(pdfData, req.Options)
+		if err != nil {
+			h.errorResponse(w, http.StatusInternalServerError, "Processing failed: "+err.Error(), requestID)
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(pdfData)))
-	w.Write(pdfData)
+	_, _ = w.Write(pdfData)
 }
 
 func generateTableHTML(data *models.TableData) string {
-	html := `<!DOCTYPE html>
+	var b []byte
+	b = append(b, []byte(`<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -544,32 +582,32 @@ tr:nth-child(even) { background: #f7fafc; }
 .footer { color: #666; font-size: 12px; margin-top: 20px; }
 </style>
 </head>
-<body>`
+<body>`)...)
 
 	if data.Title != "" {
-		html += fmt.Sprintf("<h1>%s</h1>", data.Title)
+		b = append(b, fmt.Sprintf("<h1>%s</h1>", data.Title)...)
 	}
 
-	html += "<table><thead><tr>"
+	b = append(b, []byte("<table><thead><tr>")...)
 	for _, header := range data.Headers {
-		html += fmt.Sprintf("<th>%s</th>", header)
+		b = append(b, fmt.Sprintf("<th>%s</th>", header)...)
 	}
-	html += "</tr></thead><tbody>"
+	b = append(b, []byte("</tr></thead><tbody>")...)
 
 	for _, row := range data.Rows {
-		html += "<tr>"
+		b = append(b, []byte("<tr>")...)
 		for _, cell := range row {
-			html += fmt.Sprintf("<td>%s</td>", cell)
+			b = append(b, fmt.Sprintf("<td>%s</td>", cell)...)
 		}
-		html += "</tr>"
+		b = append(b, []byte("</tr>")...)
 	}
 
-	html += "</tbody></table>"
+	b = append(b, []byte("</tbody></table>")...)
 
 	if data.Footer != "" {
-		html += fmt.Sprintf("<div class='footer'>%s</div>", data.Footer)
+		b = append(b, fmt.Sprintf("<div class='footer'>%s</div>", data.Footer)...)
 	}
 
-	html += "</body></html>"
-	return html
+	b = append(b, []byte("</body></html>")...)
+	return string(b)
 }

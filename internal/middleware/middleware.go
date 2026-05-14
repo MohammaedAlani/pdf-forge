@@ -2,8 +2,10 @@ package middleware
 
 import (
 	"context"
+	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -87,11 +89,19 @@ func Logger(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// APIKeyAuth validates API key authentication
+// APIKeyAuth validates API key authentication.
+// Health and metrics endpoints are always accessible without a key so that
+// orchestrator probes and Prometheus scrapers don't need credentials.
 func APIKeyAuth(apiKey string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if apiKey == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			switch r.URL.Path {
+			case "/health", "/healthz", "/metrics":
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -104,7 +114,7 @@ func APIKeyAuth(apiKey string) func(http.Handler) http.Handler {
 				}
 			}
 
-			if providedKey != apiKey {
+			if subtle.ConstantTimeCompare([]byte(providedKey), []byte(apiKey)) != 1 {
 				http.Error(w, `{"error": "unauthorized", "message": "Invalid or missing API key"}`, http.StatusUnauthorized)
 				return
 			}
@@ -150,9 +160,11 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 
 // RateLimiter implements basic rate limiting
 type RateLimiter struct {
+	mu       sync.Mutex
 	requests map[string][]time.Time
 	limit    int
 	window   time.Duration
+	lastGC   time.Time
 }
 
 // NewRateLimiter creates a new rate limiter
@@ -161,6 +173,7 @@ func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
 		requests: make(map[string][]time.Time),
 		limit:    limit,
 		window:   window,
+		lastGC:   time.Now(),
 	}
 }
 
@@ -175,7 +188,19 @@ func (rl *RateLimiter) Limit(next http.Handler) http.Handler {
 		ip := r.RemoteAddr
 		now := time.Now()
 
-		// Clean old requests
+		rl.mu.Lock()
+
+		// Periodically sweep expired IP buckets to bound memory growth
+		if now.Sub(rl.lastGC) > rl.window {
+			for k, ts := range rl.requests {
+				if len(ts) == 0 || now.Sub(ts[len(ts)-1]) >= rl.window {
+					delete(rl.requests, k)
+				}
+			}
+			rl.lastGC = now
+		}
+
+		// Clean expired entries for this IP
 		var valid []time.Time
 		for _, t := range rl.requests[ip] {
 			if now.Sub(t) < rl.window {
@@ -184,12 +209,15 @@ func (rl *RateLimiter) Limit(next http.Handler) http.Handler {
 		}
 
 		if len(valid) >= rl.limit {
+			rl.mu.Unlock()
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, `{"error": "rate_limited", "message": "Too many requests"}`, http.StatusTooManyRequests)
 			return
 		}
 
 		rl.requests[ip] = append(valid, now)
+		rl.mu.Unlock()
+
 		next.ServeHTTP(w, r)
 	})
 }

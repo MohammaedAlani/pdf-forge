@@ -14,6 +14,8 @@ import (
 	"pdf-forge/internal/converters"
 	"pdf-forge/internal/handlers"
 	"pdf-forge/internal/middleware"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -70,10 +72,10 @@ func main() {
 	// Setup router
 	mux := http.NewServeMux()
 
-	// Health and metrics endpoints (no auth)
+	// Health and metrics endpoints (auth-bypassed in APIKeyAuth middleware)
 	mux.HandleFunc("GET /health", h.Health)
 	mux.HandleFunc("GET /healthz", h.Health)
-	mux.HandleFunc("GET /metrics", h.Metrics)
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	// Main conversion endpoint (unified)
 	mux.HandleFunc("POST /convert", h.Convert)

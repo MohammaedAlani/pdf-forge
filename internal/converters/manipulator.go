@@ -17,28 +17,41 @@ import (
 	"pdf-forge/internal/models"
 )
 
-// PDFManipulator provides advanced PDF manipulation operations
+// PDFManipulator provides advanced PDF manipulation operations.
+//
+// Each public method creates an isolated subdirectory under `baseDir` so that
+// concurrent requests cannot clobber each other's temp files.
 type PDFManipulator struct {
-	tempDir string
+	baseDir string
 }
 
-// NewPDFManipulator creates a new manipulator instance
+// NewPDFManipulator creates a new manipulator instance.
 func NewPDFManipulator() (*PDFManipulator, error) {
-	tempDir, err := os.MkdirTemp("", "pdfforge-manip-*")
+	baseDir, err := os.MkdirTemp("", "pdfforge-manip-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	return &PDFManipulator{tempDir: tempDir}, nil
+	return &PDFManipulator{baseDir: baseDir}, nil
 }
 
-// Close cleans up resources
+// Close removes the manipulator's base temp directory.
 func (m *PDFManipulator) Close() error {
-	return os.RemoveAll(m.tempDir)
+	return os.RemoveAll(m.baseDir)
+}
+
+// scratch returns an empty subdirectory unique to a single operation along
+// with a cleanup function that removes it.
+func (m *PDFManipulator) scratch(op string) (string, func(), error) {
+	dir, err := os.MkdirTemp(m.baseDir, op+"-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create scratch dir: %w", err)
+	}
+	return dir, func() { _ = os.RemoveAll(dir) }, nil
 }
 
 // SplitRequest defines how to split a PDF
 type SplitRequest struct {
-	PDF       []byte `json:"pdf"`        // Base64 decoded PDF
+	PDF       []byte `json:"pdf"`        // Decoded PDF bytes
 	SplitType string `json:"split_type"` // "all", "range", "every_n"
 	Pages     string `json:"pages"`      // "1-3,5,7-9" for range
 	EveryN    int    `json:"every_n"`    // Split every N pages
@@ -50,16 +63,20 @@ type SplitResult struct {
 	Count int      `json:"count"`
 }
 
-// Split splits a PDF into multiple PDFs
+// Split splits a PDF into multiple PDFs.
 func (m *PDFManipulator) Split(ctx context.Context, req *SplitRequest) (*SplitResult, error) {
-	inputPath := filepath.Join(m.tempDir, "split_input.pdf")
-	if err := os.WriteFile(inputPath, req.PDF, 0644); err != nil {
+	dir, cleanup, err := m.scratch("split")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	inputPath := filepath.Join(dir, "input.pdf")
+	if err := os.WriteFile(inputPath, req.PDF, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write input: %w", err)
 	}
-	defer os.Remove(inputPath)
 
-	// Get page count
-	pageCount, err := m.getPageCount(inputPath)
+	pageCount, err := m.getPageCount(ctx, inputPath)
 	if err != nil {
 		return nil, err
 	}
@@ -68,11 +85,10 @@ func (m *PDFManipulator) Split(ctx context.Context, req *SplitRequest) (*SplitRe
 
 	switch req.SplitType {
 	case "all":
-		// Split into individual pages
 		for i := 1; i <= pageCount; i++ {
-			outputPath := filepath.Join(m.tempDir, fmt.Sprintf("page_%d.pdf", i))
+			outputPath := filepath.Join(dir, fmt.Sprintf("page_%d.pdf", i))
 			args := []string{inputPath, fmt.Sprintf("%d", i), outputPath}
-			if err := m.runQPDF(args...); err != nil {
+			if err := m.runQPDF(ctx, args...); err != nil {
 				return nil, fmt.Errorf("failed to extract page %d: %w", i, err)
 			}
 			pageData, err := os.ReadFile(outputPath)
@@ -80,16 +96,14 @@ func (m *PDFManipulator) Split(ctx context.Context, req *SplitRequest) (*SplitRe
 				return nil, err
 			}
 			pages = append(pages, pageData)
-			os.Remove(outputPath)
 		}
 
 	case "range":
-		// Parse range like "1-3,5,7-9"
 		ranges := m.parsePageRanges(req.Pages, pageCount)
 		for i, r := range ranges {
-			outputPath := filepath.Join(m.tempDir, fmt.Sprintf("range_%d.pdf", i))
+			outputPath := filepath.Join(dir, fmt.Sprintf("range_%d.pdf", i))
 			args := []string{inputPath, "--pages", inputPath, r, "--", outputPath}
-			if err := m.runQPDF(args...); err != nil {
+			if err := m.runQPDF(ctx, args...); err != nil {
 				return nil, fmt.Errorf("failed to extract range %s: %w", r, err)
 			}
 			pageData, err := os.ReadFile(outputPath)
@@ -97,11 +111,9 @@ func (m *PDFManipulator) Split(ctx context.Context, req *SplitRequest) (*SplitRe
 				return nil, err
 			}
 			pages = append(pages, pageData)
-			os.Remove(outputPath)
 		}
 
 	case "every_n":
-		// Split every N pages
 		n := req.EveryN
 		if n <= 0 {
 			n = 1
@@ -111,10 +123,10 @@ func (m *PDFManipulator) Split(ctx context.Context, req *SplitRequest) (*SplitRe
 			if end > pageCount {
 				end = pageCount
 			}
-			outputPath := filepath.Join(m.tempDir, fmt.Sprintf("chunk_%d.pdf", start))
+			outputPath := filepath.Join(dir, fmt.Sprintf("chunk_%d.pdf", start))
 			rangeStr := fmt.Sprintf("%d-%d", start, end)
 			args := []string{inputPath, "--pages", inputPath, rangeStr, "--", outputPath}
-			if err := m.runQPDF(args...); err != nil {
+			if err := m.runQPDF(ctx, args...); err != nil {
 				return nil, fmt.Errorf("failed to extract chunk %s: %w", rangeStr, err)
 			}
 			pageData, err := os.ReadFile(outputPath)
@@ -122,44 +134,53 @@ func (m *PDFManipulator) Split(ctx context.Context, req *SplitRequest) (*SplitRe
 				return nil, err
 			}
 			pages = append(pages, pageData)
-			os.Remove(outputPath)
 		}
+
+	default:
+		return nil, fmt.Errorf("unknown split_type: %q (expected all, range, every_n)", req.SplitType)
 	}
 
 	return &SplitResult{Pages: pages, Count: len(pages)}, nil
 }
 
-// ExtractPages extracts specific pages from a PDF
+// ExtractPages extracts specific pages from a PDF.
 func (m *PDFManipulator) ExtractPages(ctx context.Context, pdf []byte, pageRange string) ([]byte, error) {
-	inputPath := filepath.Join(m.tempDir, "extract_input.pdf")
-	outputPath := filepath.Join(m.tempDir, "extract_output.pdf")
+	dir, cleanup, err := m.scratch("extract")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdf, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPath := filepath.Join(dir, "output.pdf")
+
+	if err := os.WriteFile(inputPath, pdf, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write input: %w", err)
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
 
 	args := []string{inputPath, "--pages", inputPath, pageRange, "--", outputPath}
-	if err := m.runQPDF(args...); err != nil {
+	if err := m.runQPDF(ctx, args...); err != nil {
 		return nil, fmt.Errorf("failed to extract pages: %w", err)
 	}
 
 	return os.ReadFile(outputPath)
 }
 
-// RotatePages rotates pages in a PDF
+// RotatePages rotates pages in a PDF.
 func (m *PDFManipulator) RotatePages(ctx context.Context, pdf []byte, rotation int, pageRange string) ([]byte, error) {
-	inputPath := filepath.Join(m.tempDir, "rotate_input.pdf")
-	outputPath := filepath.Join(m.tempDir, "rotate_output.pdf")
+	dir, cleanup, err := m.scratch("rotate")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdf, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPath := filepath.Join(dir, "output.pdf")
+
+	if err := os.WriteFile(inputPath, pdf, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write input: %w", err)
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
 
-	// Normalize rotation to 90, 180, 270
 	rotation = ((rotation % 360) + 360) % 360
 	if rotation != 90 && rotation != 180 && rotation != 270 {
 		rotation = 90
@@ -167,11 +188,11 @@ func (m *PDFManipulator) RotatePages(ctx context.Context, pdf []byte, rotation i
 
 	rotateArg := fmt.Sprintf("+%d", rotation)
 	if pageRange == "" {
-		pageRange = "1-z" // All pages
+		pageRange = "1-z"
 	}
 
 	args := []string{inputPath, "--rotate=" + rotateArg + ":" + pageRange, "--", outputPath}
-	if err := m.runQPDF(args...); err != nil {
+	if err := m.runQPDF(ctx, args...); err != nil {
 		return nil, fmt.Errorf("failed to rotate pages: %w", err)
 	}
 
@@ -188,16 +209,20 @@ const (
 	CompressPrepress CompressLevel = "prepress" // 300 dpi, color preserving
 )
 
-// Compress compresses a PDF using Ghostscript
+// Compress compresses a PDF using Ghostscript.
 func (m *PDFManipulator) Compress(ctx context.Context, pdf []byte, level CompressLevel) ([]byte, int, error) {
-	inputPath := filepath.Join(m.tempDir, "compress_input.pdf")
-	outputPath := filepath.Join(m.tempDir, "compress_output.pdf")
+	dir, cleanup, err := m.scratch("compress")
+	if err != nil {
+		return nil, 0, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdf, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPath := filepath.Join(dir, "output.pdf")
+
+	if err := os.WriteFile(inputPath, pdf, 0o644); err != nil {
 		return nil, 0, fmt.Errorf("failed to write input: %w", err)
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
 
 	if level == "" {
 		level = CompressEbook
@@ -217,8 +242,10 @@ func (m *PDFManipulator) Compress(ctx context.Context, pdf []byte, level Compres
 	}
 
 	cmd := exec.CommandContext(ctx, "gs", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, 0, fmt.Errorf("compression failed: %w", err)
+		return nil, 0, fmt.Errorf("compression failed: %w - %s", err, stderr.String())
 	}
 
 	compressed, err := os.ReadFile(outputPath)
@@ -226,7 +253,6 @@ func (m *PDFManipulator) Compress(ctx context.Context, pdf []byte, level Compres
 		return nil, 0, err
 	}
 
-	// Calculate savings percentage
 	originalSize := len(pdf)
 	compressedSize := len(compressed)
 	savings := 0
@@ -237,15 +263,20 @@ func (m *PDFManipulator) Compress(ctx context.Context, pdf []byte, level Compres
 	return compressed, savings, nil
 }
 
-// PDFToImages converts PDF pages to images
+// PDFToImages converts PDF pages to images.
 func (m *PDFManipulator) PDFToImages(ctx context.Context, pdf []byte, format string, dpi int) ([][]byte, error) {
-	inputPath := filepath.Join(m.tempDir, "pdf2img_input.pdf")
-	outputPrefix := filepath.Join(m.tempDir, "page")
+	dir, cleanup, err := m.scratch("toimages")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdf, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPrefix := filepath.Join(dir, "page")
+
+	if err := os.WriteFile(inputPath, pdf, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write input: %w", err)
 	}
-	defer os.Remove(inputPath)
 
 	if format == "" {
 		format = "jpeg"
@@ -254,11 +285,7 @@ func (m *PDFManipulator) PDFToImages(ctx context.Context, pdf []byte, format str
 		dpi = 150
 	}
 
-	// Use pdftoppm for conversion
-	args := []string{
-		fmt.Sprintf("-r"), fmt.Sprintf("%d", dpi),
-	}
-
+	args := []string{"-r", strconv.Itoa(dpi)}
 	switch format {
 	case "png":
 		args = append(args, "-png")
@@ -267,54 +294,50 @@ func (m *PDFManipulator) PDFToImages(ctx context.Context, pdf []byte, format str
 	default:
 		args = append(args, "-jpeg")
 	}
-
 	args = append(args, inputPath, outputPrefix)
 
 	cmd := exec.CommandContext(ctx, "pdftoppm", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("PDF to image conversion failed: %w", err)
+		return nil, fmt.Errorf("PDF to image conversion failed: %w - %s", err, stderr.String())
 	}
 
-	// Collect output images
+	matches, _ := filepath.Glob(outputPrefix + "*")
 	var images [][]byte
-	pattern := outputPrefix + "*"
-	matches, _ := filepath.Glob(pattern)
-
 	for _, match := range matches {
 		imgData, err := os.ReadFile(match)
 		if err != nil {
 			continue
 		}
 		images = append(images, imgData)
-		os.Remove(match)
 	}
 
 	return images, nil
 }
 
-// GetInfo returns PDF metadata and info
+// GetInfo returns PDF metadata and info via pdfinfo.
 func (m *PDFManipulator) GetInfo(ctx context.Context, pdf []byte) (*models.PDFInfo, error) {
-	inputPath := filepath.Join(m.tempDir, "info_input.pdf")
+	dir, cleanup, err := m.scratch("info")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdf, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	if err := os.WriteFile(inputPath, pdf, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write input: %w", err)
 	}
-	defer os.Remove(inputPath)
 
-	// Use pdfinfo command
 	cmd := exec.CommandContext(ctx, "pdfinfo", inputPath)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get PDF info: %w", err)
 	}
 
-	info := &models.PDFInfo{
-		FileSize: int64(len(pdf)),
-	}
+	info := &models.PDFInfo{FileSize: int64(len(pdf))}
 
-	// Parse output
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(string(output), "\n") {
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
 			continue
@@ -342,39 +365,33 @@ func (m *PDFManipulator) GetInfo(ctx context.Context, pdf []byte) (*models.PDFIn
 		case "PDF version":
 			info.PDFVersion = value
 		case "Encrypted":
-			info.Encrypted = value == "yes"
+			info.Encrypted = !strings.HasPrefix(value, "no")
 		}
 	}
 
 	return info, nil
 }
 
-// AddPageNumbers adds page numbers to a PDF
-func (m *PDFManipulator) AddPageNumbers(ctx context.Context, pdf []byte, position string, format string) ([]byte, error) {
-	// This is a complex operation that typically requires a library like pdfcpu
-	// For now, return the original PDF
-	// In production, integrate pdfcpu or use a different approach
-	return pdf, nil
-}
-
-// RemovePages removes specific pages from a PDF
+// RemovePages removes specific pages from a PDF.
 func (m *PDFManipulator) RemovePages(ctx context.Context, pdf []byte, pagesToRemove string) ([]byte, error) {
-	inputPath := filepath.Join(m.tempDir, "remove_input.pdf")
-	outputPath := filepath.Join(m.tempDir, "remove_output.pdf")
+	dir, cleanup, err := m.scratch("remove")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdf, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPath := filepath.Join(dir, "output.pdf")
+
+	if err := os.WriteFile(inputPath, pdf, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write input: %w", err)
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
 
-	// Get page count
-	pageCount, err := m.getPageCount(inputPath)
+	pageCount, err := m.getPageCount(ctx, inputPath)
 	if err != nil {
 		return nil, err
 	}
 
-	// Parse pages to remove
 	removeSet := make(map[int]bool)
 	for _, part := range strings.Split(pagesToRemove, ",") {
 		part = strings.TrimSpace(part)
@@ -393,7 +410,6 @@ func (m *PDFManipulator) RemovePages(ctx context.Context, pdf []byte, pagesToRem
 		}
 	}
 
-	// Build keep range
 	var keepRanges []string
 	inRange := false
 	rangeStart := 0
@@ -404,20 +420,18 @@ func (m *PDFManipulator) RemovePages(ctx context.Context, pdf []byte, pagesToRem
 				rangeStart = i
 				inRange = true
 			}
-		} else {
-			if inRange {
-				if rangeStart == i-1 {
-					keepRanges = append(keepRanges, fmt.Sprintf("%d", rangeStart))
-				} else {
-					keepRanges = append(keepRanges, fmt.Sprintf("%d-%d", rangeStart, i-1))
-				}
-				inRange = false
+		} else if inRange {
+			if rangeStart == i-1 {
+				keepRanges = append(keepRanges, strconv.Itoa(rangeStart))
+			} else {
+				keepRanges = append(keepRanges, fmt.Sprintf("%d-%d", rangeStart, i-1))
 			}
+			inRange = false
 		}
 	}
 	if inRange {
 		if rangeStart == pageCount {
-			keepRanges = append(keepRanges, fmt.Sprintf("%d", rangeStart))
+			keepRanges = append(keepRanges, strconv.Itoa(rangeStart))
 		} else {
 			keepRanges = append(keepRanges, fmt.Sprintf("%d-%d", rangeStart, pageCount))
 		}
@@ -429,43 +443,46 @@ func (m *PDFManipulator) RemovePages(ctx context.Context, pdf []byte, pagesToRem
 
 	keepStr := strings.Join(keepRanges, ",")
 	args := []string{inputPath, "--pages", inputPath, keepStr, "--", outputPath}
-	if err := m.runQPDF(args...); err != nil {
+	if err := m.runQPDF(ctx, args...); err != nil {
 		return nil, fmt.Errorf("failed to remove pages: %w", err)
 	}
 
 	return os.ReadFile(outputPath)
 }
 
-// ReorderPages reorders pages in a PDF
+// ReorderPages reorders pages in a PDF.
 func (m *PDFManipulator) ReorderPages(ctx context.Context, pdf []byte, newOrder []int) ([]byte, error) {
-	inputPath := filepath.Join(m.tempDir, "reorder_input.pdf")
-	outputPath := filepath.Join(m.tempDir, "reorder_output.pdf")
+	dir, cleanup, err := m.scratch("reorder")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
-	if err := os.WriteFile(inputPath, pdf, 0644); err != nil {
+	inputPath := filepath.Join(dir, "input.pdf")
+	outputPath := filepath.Join(dir, "output.pdf")
+
+	if err := os.WriteFile(inputPath, pdf, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write input: %w", err)
 	}
-	defer os.Remove(inputPath)
-	defer os.Remove(outputPath)
 
-	// Build page string
-	var pageStrs []string
+	pageStrs := make([]string, 0, len(newOrder))
 	for _, p := range newOrder {
-		pageStrs = append(pageStrs, fmt.Sprintf("%d", p))
+		pageStrs = append(pageStrs, strconv.Itoa(p))
 	}
 	pageStr := strings.Join(pageStrs, ",")
 
 	args := []string{inputPath, "--pages", inputPath, pageStr, "--", outputPath}
-	if err := m.runQPDF(args...); err != nil {
+	if err := m.runQPDF(ctx, args...); err != nil {
 		return nil, fmt.Errorf("failed to reorder pages: %w", err)
 	}
 
 	return os.ReadFile(outputPath)
 }
 
-// Helper functions
+// Helpers
 
-func (m *PDFManipulator) runQPDF(args ...string) error {
-	cmd := exec.Command("qpdf", args...)
+func (m *PDFManipulator) runQPDF(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "qpdf", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -474,8 +491,8 @@ func (m *PDFManipulator) runQPDF(args ...string) error {
 	return nil
 }
 
-func (m *PDFManipulator) getPageCount(pdfPath string) (int, error) {
-	cmd := exec.Command("qpdf", "--show-npages", pdfPath)
+func (m *PDFManipulator) getPageCount(ctx context.Context, pdfPath string) (int, error) {
+	cmd := exec.CommandContext(ctx, "qpdf", "--show-npages", pdfPath)
 	output, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("failed to get page count: %w", err)
@@ -494,26 +511,25 @@ func (m *PDFManipulator) parsePageRanges(rangeStr string, maxPage int) []string 
 		if part == "" {
 			continue
 		}
-		// Replace 'z' or 'end' with actual last page
-		part = strings.ReplaceAll(part, "z", fmt.Sprintf("%d", maxPage))
-		part = strings.ReplaceAll(part, "end", fmt.Sprintf("%d", maxPage))
+		part = strings.ReplaceAll(part, "z", strconv.Itoa(maxPage))
+		part = strings.ReplaceAll(part, "end", strconv.Itoa(maxPage))
 		ranges = append(ranges, part)
 	}
 	return ranges
 }
 
-// ImageToBase64 converts image bytes to base64 string
+// ImageToBase64 converts image bytes to base64 string.
 func ImageToBase64(imgData []byte, format string) string {
 	return base64.StdEncoding.EncodeToString(imgData)
 }
 
-// DecodeImage decodes image bytes to image.Image
+// DecodeImage decodes image bytes to image.Image.
 func DecodeImage(data []byte) (image.Image, string, error) {
 	reader := bytes.NewReader(data)
 	return image.Decode(reader)
 }
 
-// EncodeImage encodes image.Image to bytes
+// EncodeImage encodes image.Image to bytes.
 func EncodeImage(img image.Image, format string) ([]byte, error) {
 	var buf bytes.Buffer
 	switch format {
@@ -527,4 +543,11 @@ func EncodeImage(img image.Image, format string) ([]byte, error) {
 		err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90})
 		return buf.Bytes(), err
 	}
+}
+
+// AddPageNumbers adds page numbers via pdfcpu (text stamp).
+// Position can be "bottom-center" (default), "bottom-left", "bottom-right",
+// "top-center", "top-left", "top-right".
+func (m *PDFManipulator) AddPageNumbers(ctx context.Context, pdf []byte, position, format string) ([]byte, error) {
+	return AddPageNumbersWithPDFCPU(pdf, position, format)
 }
