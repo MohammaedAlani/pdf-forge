@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -159,9 +160,14 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 }
 
 // RateLimiter implements basic rate limiting
+type rateBucket struct {
+	count int
+	start time.Time
+}
+
 type RateLimiter struct {
 	mu       sync.Mutex
-	requests map[string][]time.Time
+	requests map[string]*rateBucket
 	limit    int
 	window   time.Duration
 	lastGC   time.Time
@@ -170,7 +176,7 @@ type RateLimiter struct {
 // NewRateLimiter creates a new rate limiter
 func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
 	return &RateLimiter{
-		requests: make(map[string][]time.Time),
+		requests: make(map[string]*rateBucket),
 		limit:    limit,
 		window:   window,
 		lastGC:   time.Now(),
@@ -185,37 +191,40 @@ func (rl *RateLimiter) Limit(next http.Handler) http.Handler {
 			return
 		}
 
-		ip := r.RemoteAddr
+		if r.URL.Path == "/health" || r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			ip = r.RemoteAddr
+		}
 		now := time.Now()
 
 		rl.mu.Lock()
 
 		// Periodically sweep expired IP buckets to bound memory growth
 		if now.Sub(rl.lastGC) > rl.window {
-			for k, ts := range rl.requests {
-				if len(ts) == 0 || now.Sub(ts[len(ts)-1]) >= rl.window {
+			for k, bucket := range rl.requests {
+				if now.Sub(bucket.start) >= rl.window {
 					delete(rl.requests, k)
 				}
 			}
 			rl.lastGC = now
 		}
 
-		// Clean expired entries for this IP
-		var valid []time.Time
-		for _, t := range rl.requests[ip] {
-			if now.Sub(t) < rl.window {
-				valid = append(valid, t)
-			}
+		bucket := rl.requests[ip]
+		if bucket == nil || now.Sub(bucket.start) >= rl.window {
+			bucket = &rateBucket{start: now}
+			rl.requests[ip] = bucket
 		}
-
-		if len(valid) >= rl.limit {
+		if bucket.count >= rl.limit {
 			rl.mu.Unlock()
 			w.Header().Set("Retry-After", "60")
-			http.Error(w, `{"error": "rate_limited", "message": "Too many requests"}`, http.StatusTooManyRequests)
+			http.Error(w, `{"error":"rate_limited"}`, http.StatusTooManyRequests)
 			return
 		}
-
-		rl.requests[ip] = append(valid, now)
+		bucket.count++
 		rl.mu.Unlock()
 
 		next.ServeHTTP(w, r)

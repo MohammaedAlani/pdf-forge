@@ -26,20 +26,20 @@ type WebhookService struct {
 
 // WebhookPayload is the data sent to webhook endpoints
 type WebhookPayload struct {
-	Event       string    `json:"event"`       // conversion.completed, conversion.failed
-	RequestID   string    `json:"request_id"`
-	Timestamp   time.Time `json:"timestamp"`
-	Success     bool      `json:"success"`
-	Error       string    `json:"error,omitempty"`
-	
+	Event     string    `json:"event"` // conversion.completed, conversion.failed
+	RequestID string    `json:"request_id"`
+	Timestamp time.Time `json:"timestamp"`
+	Success   bool      `json:"success"`
+	Error     string    `json:"error,omitempty"`
+
 	// Conversion details
 	ConversionType string `json:"conversion_type,omitempty"`
 	FileSize       int64  `json:"file_size,omitempty"`
 	Duration       int64  `json:"duration_ms,omitempty"`
-	
+
 	// Optional: PDF data (if include_pdf is true)
 	PDF string `json:"pdf,omitempty"` // Base64 encoded
-	
+
 	// Storage result (if storage was configured)
 	Storage *models.StorageResult `json:"storage,omitempty"`
 }
@@ -75,6 +75,9 @@ func (s *WebhookService) Send(ctx context.Context, config *models.WebhookConfig,
 
 	var lastErr error
 	maxRetries := config.RetryCount
+	if maxRetries > 5 {
+		maxRetries = 5
+	}
 	if maxRetries <= 0 {
 		maxRetries = s.retries
 	}
@@ -126,7 +129,7 @@ func (s *WebhookService) Send(ctx context.Context, config *models.WebhookConfig,
 		}
 
 		// Read response body for logging
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
 
 		// Check for success (2xx status codes)

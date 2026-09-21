@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,26 +13,29 @@ import (
 	"time"
 
 	"pdf-forge/internal/converters"
+	"pdf-forge/internal/limits"
 	"pdf-forge/internal/metrics"
 	"pdf-forge/internal/middleware"
 	"pdf-forge/internal/models"
 )
 
 type Handler struct {
-	converter *converters.ChromeConverter
-	processor *converters.PDFProcessor
-	logger    *slog.Logger
-	startTime time.Time
-	version   string
+	converter  *converters.ChromeConverter
+	processor  *converters.PDFProcessor
+	logger     *slog.Logger
+	startTime  time.Time
+	version    string
+	processing limits.Gate
 }
 
 func NewHandler(c *converters.ChromeConverter, p *converters.PDFProcessor, l *slog.Logger, v string) *Handler {
 	return &Handler{
-		converter: c,
-		processor: p,
-		logger:    l,
-		startTime: time.Now(),
-		version:   v,
+		converter:  c,
+		processor:  p,
+		logger:     l,
+		startTime:  time.Now(),
+		version:    v,
+		processing: limits.NewGate(2),
 	}
 }
 
@@ -46,6 +50,11 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 		Conversions: h.converter.GetMetrics(),
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if !h.converter.Healthy() {
+		response.Status = "unhealthy"
+		response.Chrome = "unavailable"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
 	_ = json.NewEncoder(w).Encode(response)
 }
 
@@ -58,6 +67,12 @@ func (h *Handler) Convert(w http.ResponseWriter, r *http.Request) {
 		h.handleDecodeError(w, err, requestID)
 		return
 	}
+
+	h.convertRequest(w, r, req)
+}
+
+func (h *Handler) convertRequest(w http.ResponseWriter, r *http.Request, req models.ConversionRequest) {
+	requestID := middleware.GetRequestID(r.Context())
 
 	if req.IsBase64 && req.HTML != "" {
 		decoded, err := base64.StdEncoding.DecodeString(req.HTML)
@@ -103,12 +118,16 @@ func (h *Handler) Convert(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.logger.Error("Conversion failed", "request_id", requestID, "type", convType, "error", err)
 		metrics.Record(convType, "failure", time.Since(start).Seconds(), 0)
-		h.errorResponse(w, http.StatusInternalServerError, err.Error(), requestID)
+		status := http.StatusInternalServerError
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			status = http.StatusGatewayTimeout
+		}
+		h.errorResponse(w, status, err.Error(), requestID)
 		return
 	}
 
 	if req.Options != nil && h.processor != nil {
-		pdfData, err = h.processor.Process(pdfData, req.Options)
+		pdfData, err = h.process(r.Context(), pdfData, req.Options)
 		if err != nil {
 			h.logger.Error("Processing failed", "request_id", requestID, "error", err)
 			metrics.Record(convType, "failure", time.Since(start).Seconds(), 0)
@@ -129,8 +148,13 @@ func (h *Handler) Convert(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ConvertHTML(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "application/json") {
-		body, _ := io.ReadAll(r.Body)
-		r.Body = io.NopCloser(strings.NewReader(fmt.Sprintf(`{"type":"html","html":%q}`, string(body))))
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			h.handleDecodeError(w, err, middleware.GetRequestID(r.Context()))
+			return
+		}
+		h.convertRequest(w, r, models.ConversionRequest{Type: models.ConvertHTML, HTML: string(body)})
+		return
 	}
 	h.Convert(w, r)
 }
@@ -155,6 +179,10 @@ func (h *Handler) MergePDFs(w http.ResponseWriter, r *http.Request) {
 		h.handleDecodeError(w, err, requestID)
 		return
 	}
+	if len(req.PDFs) > limits.MaxBatchItems {
+		h.errorResponse(w, http.StatusBadRequest, "Too many PDFs (maximum 32)", requestID)
+		return
+	}
 	if len(req.PDFs) < 2 {
 		h.errorResponse(w, http.StatusBadRequest, "At least two base64-encoded PDFs are required", requestID)
 		return
@@ -171,7 +199,7 @@ func (h *Handler) MergePDFs(w http.ResponseWriter, r *http.Request) {
 		decoded = append(decoded, data)
 	}
 
-	merged, err := h.processor.MergePDFs(decoded)
+	merged, err := h.merge(r.Context(), decoded)
 	if err != nil {
 		h.logger.Error("Merge failed", "request_id", requestID, "error", err)
 		metrics.Record("merge", "failure", time.Since(start).Seconds(), 0)
@@ -216,4 +244,36 @@ func (h *Handler) handleDecodeError(w http.ResponseWriter, err error, requestID 
 		return
 	}
 	h.errorResponse(w, http.StatusBadRequest, "Invalid JSON payload: "+err.Error(), requestID)
+}
+
+// SetProcessingWorkers configures the shared post-processing/manipulation gate
+// before the server starts accepting requests.
+func (h *Handler) SetProcessingWorkers(n int) { h.processing = limits.NewGate(n) }
+
+func (h *Handler) process(ctx context.Context, pdf []byte, opts *models.PDFOptions) ([]byte, error) {
+	if opts == nil || (opts.Watermark == nil && opts.Metadata == nil && opts.Security == nil) {
+		return pdf, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	start := time.Now()
+	if err := h.processing.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer h.processing.Release()
+	defer func() { metrics.StageDuration.WithLabelValues("postprocess").Observe(time.Since(start).Seconds()) }()
+	out, err := h.processor.Process(ctx, pdf, opts)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return out, err
+}
+func (h *Handler) merge(ctx context.Context, pdfs [][]byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	if err := h.processing.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer h.processing.Release()
+	return h.processor.MergePDFs(ctx, pdfs)
 }

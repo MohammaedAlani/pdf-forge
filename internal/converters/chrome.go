@@ -5,18 +5,25 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"pdf-forge/internal/limits"
 	"pdf-forge/internal/metrics"
 	"pdf-forge/internal/models"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/emulation"
+	cdpio "github.com/chromedp/cdproto/io"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/yuin/goldmark"
 )
@@ -25,68 +32,183 @@ import (
 const (
 	defaultHTMLTimeout = 90 * time.Second
 	defaultURLTimeout  = 60 * time.Second
-	htmlSettleWait     = 1500 * time.Millisecond
-	urlSettleWait      = 1500 * time.Millisecond
 )
 
-// ChromeConverter manages a single shared Chrome allocator and bounds
-// concurrent conversions via a semaphore. inUse tracks how many slots are
-// currently busy for /health reporting.
+// ChromeConverter reuses a browser, with isolated browser contexts per job.
+// The semaphore bounds active tabs; HTTP admission bounds waiting requests.
 type ChromeConverter struct {
-	allocCtx    context.Context
-	cancelAlloc context.CancelFunc
-	semaphore   chan struct{}
-	inUse       atomic.Int32
+	allocCtx      context.Context
+	cancelAlloc   context.CancelFunc
+	browserMu     sync.Mutex
+	browserCtx    context.Context
+	cancelBrowser context.CancelFunc
+	semaphore     chan struct{}
+	inUse         atomic.Int32
 }
 
-// NewChromeConverter creates the Chrome allocator and warms up one tab so that
-// any launch failure surfaces immediately.
 func NewChromeConverter(maxWorkers int) (*ChromeConverter, error) {
 	if maxWorkers <= 0 {
 		maxWorkers = 1
 	}
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-setuid-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-	)
-
+		chromedp.Flag("headless", true), chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true), chromedp.Flag("disable-setuid-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", os.Getenv("CHROME_USE_DEV_SHM") != "true"))
 	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-
-	// Verify Chrome can launch — fail fast if it can't.
-	warmCtx, warmCancel := context.WithTimeout(allocCtx, 20*time.Second)
-	defer warmCancel()
-	ctx, c := chromedp.NewContext(warmCtx)
-	if err := chromedp.Run(ctx); err != nil {
-		c()
-		cancel()
-		return nil, fmt.Errorf("chrome warm-up failed: %w", err)
+	c := &ChromeConverter{allocCtx: allocCtx, cancelAlloc: cancel, semaphore: make(chan struct{}, maxWorkers)}
+	if _, err := c.browser(); err != nil {
+		c.Close()
+		return nil, err
 	}
-	c()
+	return c, nil
+}
 
-	return &ChromeConverter{
-		allocCtx:    allocCtx,
-		cancelAlloc: cancel,
-		semaphore:   make(chan struct{}, maxWorkers),
-	}, nil
+// browser replaces a crashed browser for subsequent jobs. Active jobs fail and
+// are never silently retried, since navigating a URL may have side effects.
+func (c *ChromeConverter) browser() (context.Context, error) {
+	c.browserMu.Lock()
+	defer c.browserMu.Unlock()
+	if err := c.allocCtx.Err(); err != nil {
+		return nil, err
+	}
+	if c.browserCtx != nil && c.browserCtx.Err() == nil {
+		b := chromedp.FromContext(c.browserCtx).Browser
+		select {
+		case <-b.LostConnection:
+		default:
+			return c.browserCtx, nil
+		}
+	}
+	if c.cancelBrowser != nil {
+		c.cancelBrowser()
+	}
+	ctx, cancel := chromedp.NewContext(c.allocCtx)
+	timer := time.AfterFunc(20*time.Second, cancel)
+	err := chromedp.Run(ctx)
+	timer.Stop()
+	if err != nil || ctx.Err() != nil {
+		cancel()
+		if err == nil {
+			err = ctx.Err()
+		}
+		return nil, fmt.Errorf("chrome startup failed: %w", err)
+	}
+	c.browserCtx, c.cancelBrowser = ctx, cancel
+	metrics.BrowserStarts.Inc()
+	return ctx, nil
 }
 
 func (c *ChromeConverter) Close() {
 	c.cancelAlloc()
+	c.browserMu.Lock()
+	defer c.browserMu.Unlock()
+	if c.cancelBrowser != nil {
+		c.cancelBrowser()
+	}
 }
 
-func (c *ChromeConverter) acquire() {
-	c.semaphore <- struct{}{}
-	c.inUse.Add(1)
-	metrics.WorkersInUse.Set(float64(c.inUse.Load()))
+func (c *ChromeConverter) Healthy() bool {
+	c.browserMu.Lock()
+	defer c.browserMu.Unlock()
+	if c.browserCtx == nil || c.browserCtx.Err() != nil {
+		return false
+	}
+	select {
+	case <-chromedp.FromContext(c.browserCtx).Browser.LostConnection:
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *ChromeConverter) acquire(ctx context.Context) error {
+	start := time.Now()
+	defer func() { metrics.StageDuration.WithLabelValues("render_queue").Observe(time.Since(start).Seconds()) }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.semaphore <- struct{}{}:
+		c.inUse.Add(1)
+		metrics.WorkersInUse.Inc()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.allocCtx.Done():
+		return c.allocCtx.Err()
+	}
 }
 
 func (c *ChromeConverter) release() {
 	<-c.semaphore
 	c.inUse.Add(-1)
-	metrics.WorkersInUse.Set(float64(c.inUse.Load()))
+	metrics.WorkersInUse.Dec()
+}
+
+// task bridges the request deadline/cancellation to an isolated tab without
+// giving the request ownership of the shared browser.
+func (c *ChromeConverter) task(ctx context.Context) (context.Context, func(), error) {
+	owner, err := c.browser()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	tab, cancel := chromedp.NewContext(owner, chromedp.WithNewBrowserContext())
+	stop := context.AfterFunc(ctx, cancel)
+	return tab, func() { stop(); cancel() }, nil
+}
+
+// documentReady waits for document resources instead of sleeping. Applications
+// can additionally supply a readiness predicate for asynchronous page content.
+func documentReady(opts *models.PDFOptions) chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		if opts != nil && opts.WaitForExpression != "" {
+			if err := chromedp.Poll(opts.WaitForExpression, nil, chromedp.WithPollingTimeout(30*time.Second)).Do(ctx); err != nil {
+				return err
+			}
+		}
+		script := `(async () => {
+   if (document.readyState !== "complete") await new Promise(resolve => window.addEventListener("load", resolve, {once:true}));
+   await document.fonts.ready;
+   await Promise.all(Array.from(document.images, img => { img.loading = "eager"; return img.decode().catch(() => {}); }));
+   return true;
+  })()`
+		if err := chromedp.Evaluate(script, nil, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) }).Do(ctx); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// printPDF reads bounded chunks instead of one large Base64 protocol response.
+func printPDF(ctx context.Context, opts *models.PDFOptions) ([]byte, error) {
+	_, stream, err := applyPrintOptions(page.PrintToPDF(), opts).WithTransferMode(page.PrintToPDFTransferModeReturnAsStream).Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cdpio.Close(stream).Do(ctx)
+	var out limits.Buffer
+	for {
+		var result cdpio.ReadReturns
+		if err := cdp.Execute(ctx, cdpio.CommandRead, cdpio.Read(stream).WithSize(64<<10), &result); err != nil {
+			return nil, err
+		}
+		chunk := []byte(result.Data)
+		if result.Base64encoded {
+			chunk, err = base64.StdEncoding.DecodeString(result.Data)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if _, err := out.Write(chunk); err != nil {
+			return nil, err
+		}
+		if result.EOF {
+			return out.Bytes(), nil
+		}
+	}
 }
 
 // GetWorkerStatus returns the current worker pool snapshot.
@@ -180,13 +302,19 @@ func headerFooterHTML(kind, left, center, right string, fontSize float64) string
 
 // ConvertHTML renders an HTML document and returns PDF bytes.
 func (c *ChromeConverter) ConvertHTML(ctx context.Context, html string, opts *models.PDFOptions) ([]byte, error) {
-	c.acquire()
+	ctx, deadlineCancel := context.WithTimeout(ctx, defaultHTMLTimeout)
+	defer deadlineCancel()
+	if err := c.acquire(ctx); err != nil {
+		return nil, err
+	}
 	defer c.release()
-
-	taskCtx, cancel := chromedp.NewContext(c.allocCtx)
+	taskCtx, cancel, err := c.task(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer cancel()
-	taskCtx, cancel = context.WithTimeout(taskCtx, defaultHTMLTimeout)
-	defer cancel()
+	start := time.Now()
+	defer func() { metrics.StageDuration.WithLabelValues("render").Observe(time.Since(start).Seconds()) }()
 
 	actions := []chromedp.Action{
 		chromedp.Navigate("about:blank"),
@@ -208,18 +336,16 @@ func (c *ChromeConverter) ConvertHTML(ctx context.Context, html string, opts *mo
 		}))
 	}
 
-	// Allow late-loading CSS/fonts to settle.
-	actions = append(actions, chromedp.Sleep(htmlSettleWait))
+	actions = append(actions, documentReady(opts))
 
 	var buf []byte
 	actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
-		p := applyPrintOptions(page.PrintToPDF(), opts)
 		var err error
-		buf, _, err = p.Do(ctx)
+		buf, err = printPDF(ctx, opts)
 		return err
 	}))
 
-	if err := chromedp.Run(taskCtx, actions...); err != nil {
+	if err = chromedp.Run(taskCtx, actions...); err != nil {
 		return nil, err
 	}
 	if opts != nil && opts.Grayscale {
@@ -233,30 +359,37 @@ func (c *ChromeConverter) ConvertHTML(ctx context.Context, html string, opts *mo
 // ConvertURL fetches a URL and returns PDF bytes. The URL is validated against
 // SSRF — private, loopback, link-local and non-HTTP(S) targets are rejected.
 func (c *ChromeConverter) ConvertURL(ctx context.Context, raw string, opts *models.PDFOptions) ([]byte, error) {
-	if err := ValidateURL(raw); err != nil {
+	ctx, deadlineCancel := context.WithTimeout(ctx, defaultURLTimeout)
+	defer deadlineCancel()
+	if err := validateURL(ctx, raw); err != nil {
 		return nil, err
 	}
-
-	c.acquire()
+	if err := c.acquire(ctx); err != nil {
+		return nil, err
+	}
 	defer c.release()
-
-	taskCtx, cancel := chromedp.NewContext(c.allocCtx)
+	taskCtx, cancel, err := c.task(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer cancel()
-	taskCtx, cancel = context.WithTimeout(taskCtx, defaultURLTimeout)
-	defer cancel()
+	start := time.Now()
+	defer func() { metrics.StageDuration.WithLabelValues("render").Observe(time.Since(start).Seconds()) }()
 
 	var buf []byte
-	err := chromedp.Run(taskCtx,
+	err = chromedp.Run(taskCtx,
 		chromedp.Navigate(raw),
 		chromedp.WaitReady("body"),
-		chromedp.Sleep(urlSettleWait),
+		documentReady(opts),
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			p := applyPrintOptions(page.PrintToPDF(), opts)
 			var perr error
-			buf, _, perr = p.Do(ctx)
+			buf, perr = printPDF(ctx, opts)
 			return perr
 		}),
 	)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	return buf, err
 }
 
@@ -285,7 +418,8 @@ a { color: #0366d6; }
 
 // detectImageMIME detects the MIME type from base64-encoded image data.
 func detectImageMIME(b64 string) string {
-	if data, err := base64.StdEncoding.DecodeString(b64); err == nil && len(data) > 0 {
+	data, _ := io.ReadAll(io.LimitReader(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64)), 512))
+	if len(data) > 0 {
 		return http.DetectContentType(data)
 	}
 	return "image/png"
@@ -323,6 +457,12 @@ img { max-width:100%; max-height:100%; }
 // services (loopback, RFC1918, link-local, IPv6 ULA, IMDS metadata, etc.) or
 // load non-HTTP schemes such as file://, data:, ftp:, etc.
 func ValidateURL(raw string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return validateURL(ctx, raw)
+}
+
+func validateURL(ctx context.Context, raw string) error {
 	if raw == "" {
 		return fmt.Errorf("url is required")
 	}
@@ -345,7 +485,7 @@ func ValidateURL(raw string) error {
 		return nil
 	}
 	// Resolve hostname and reject if ANY resolved IP is internal.
-	addrs, err := net.LookupIP(host)
+	addrs, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return fmt.Errorf("dns lookup failed for %s: %w", host, err)
 	}

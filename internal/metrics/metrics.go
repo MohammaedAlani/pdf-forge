@@ -9,7 +9,11 @@ import (
 )
 
 var (
-	ConversionsTotal = promauto.NewCounterVec(
+	BrowserStarts     = promauto.NewCounter(prometheus.CounterOpts{Name: "pdfforge_browser_starts_total", Help: "Browser launches, including crash recovery."})
+	StageDuration     = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "pdfforge_stage_duration_seconds", Help: "Latency by processing stage.", Buckets: prometheus.ExponentialBuckets(0.001, 2, 18)}, []string{"stage"})
+	AdmissionRejected = promauto.NewCounter(prometheus.CounterOpts{Name: "pdfforge_admission_rejected_total", Help: "Requests rejected due to resource admission limits."})
+	AdmissionBytes    = promauto.NewGauge(prometheus.GaugeOpts{Name: "pdfforge_admission_reserved_bytes", Help: "Reserved input bytes, including background jobs."})
+	ConversionsTotal  = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "pdfforge_conversions_total",
 			Help: "Total conversions processed, labeled by type and outcome.",

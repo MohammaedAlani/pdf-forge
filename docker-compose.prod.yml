@@ -32,9 +32,14 @@ services:
       # ===================
       # Number of concurrent PDF workers (adjust based on CPU/RAM)
       - MAX_WORKERS=${MAX_WORKERS:-4}
+      - CHROME_USE_DEV_SHM=${CHROME_USE_DEV_SHM:-true}
+      - PROCESSING_WORKERS=${PROCESSING_WORKERS:-2}
+      - MAX_INFLIGHT_REQUESTS=${MAX_INFLIGHT_REQUESTS:-16}
+      - MAX_INFLIGHT_BYTES=${MAX_INFLIGHT_BYTES:-134217728}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-120}
       
-      # Maximum request body size in bytes (default: 500MB)
-      - MAX_BODY_SIZE=${MAX_BODY_SIZE:-524288000}
+      # Maximum request body size in bytes (default: 32 MiB)
+      - MAX_BODY_SIZE=${MAX_BODY_SIZE:-33554432}
       
       # ===================
       # Rate Limiting
@@ -64,6 +69,8 @@ services:
       # Server
       # ===================
       - ADDRESS=:8080
+
+    shm_size: 256mb
 
     # Resource limits
     deploy:

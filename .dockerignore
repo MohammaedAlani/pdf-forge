@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+!.env.example
+.idea
+.claude
+bin
+coverage.*
+*.log

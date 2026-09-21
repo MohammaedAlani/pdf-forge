@@ -2,12 +2,14 @@ package converters
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 
+	"pdf-forge/internal/limits"
 	"pdf-forge/internal/models"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
@@ -43,7 +45,12 @@ func (p *PDFProcessor) scratch(op string) (string, func(), error) {
 }
 
 // ApplySecurity applies password protection to a PDF using qpdf.
-func (p *PDFProcessor) ApplySecurity(pdfData []byte, security *models.PDFSecurity) ([]byte, error) {
+func (p *PDFProcessor) ApplySecurity(ctx context.Context, pdfData []byte, security *models.PDFSecurity) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if security == nil {
 		return pdfData, nil
 	}
@@ -107,18 +114,23 @@ func (p *PDFProcessor) ApplySecurity(pdfData []byte, security *models.PDFSecurit
 
 	args = append(args, "--", inputPath, outputPath)
 
-	cmd := exec.Command("qpdf", args...)
-	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "qpdf", args...)
+	var stderr diagnosticBuffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runCommand(ctx, cmd, dir); err != nil {
 		return nil, fmt.Errorf("qpdf encryption failed: %w - %s", err, stderr.String())
 	}
 
-	return os.ReadFile(outputPath)
+	return limits.ReadFile(outputPath)
 }
 
 // ApplyWatermark applies a text watermark to PDF pages using pdfcpu.
-func (p *PDFProcessor) ApplyWatermark(pdfData []byte, w *models.Watermark) ([]byte, error) {
+func (p *PDFProcessor) ApplyWatermark(ctx context.Context, pdfData []byte, w *models.Watermark) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if w == nil || w.Text == "" {
 		return pdfData, nil
 	}
@@ -150,7 +162,7 @@ func (p *PDFProcessor) ApplyWatermark(pdfData []byte, w *models.Watermark) ([]by
 		return nil, fmt.Errorf("watermark setup failed: %w", err)
 	}
 
-	var out bytes.Buffer
+	var out limits.Buffer
 	if err := api.AddWatermarks(bytes.NewReader(pdfData), &out, nil, wm, model.NewDefaultConfiguration()); err != nil {
 		return nil, fmt.Errorf("watermark apply failed: %w", err)
 	}
@@ -158,7 +170,12 @@ func (p *PDFProcessor) ApplyWatermark(pdfData []byte, w *models.Watermark) ([]by
 }
 
 // SetMetadata sets PDF document properties (Title/Author/Subject/Keywords/Creator) via pdfcpu.
-func (p *PDFProcessor) SetMetadata(pdfData []byte, m *models.PDFMetadata) ([]byte, error) {
+func (p *PDFProcessor) SetMetadata(ctx context.Context, pdfData []byte, m *models.PDFMetadata) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if m == nil {
 		return pdfData, nil
 	}
@@ -183,7 +200,7 @@ func (p *PDFProcessor) SetMetadata(pdfData []byte, m *models.PDFMetadata) ([]byt
 		return pdfData, nil
 	}
 
-	var out bytes.Buffer
+	var out limits.Buffer
 	if err := api.AddProperties(bytes.NewReader(pdfData), &out, props, model.NewDefaultConfiguration()); err != nil {
 		return nil, fmt.Errorf("metadata apply failed: %w", err)
 	}
@@ -191,7 +208,12 @@ func (p *PDFProcessor) SetMetadata(pdfData []byte, m *models.PDFMetadata) ([]byt
 }
 
 // MergePDFs merges multiple PDFs using qpdf.
-func (p *PDFProcessor) MergePDFs(pdfs [][]byte) ([]byte, error) {
+func (p *PDFProcessor) MergePDFs(ctx context.Context, pdfs [][]byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(pdfs) == 0 {
 		return nil, fmt.Errorf("no PDFs provided for merge")
 	}
@@ -219,21 +241,26 @@ func (p *PDFProcessor) MergePDFs(pdfs [][]byte) ([]byte, error) {
 	args = append(args, inputPaths...)
 	args = append(args, "--", outputPath)
 
-	cmd := exec.Command("qpdf", args...)
-	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "qpdf", args...)
+	var stderr diagnosticBuffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runCommand(ctx, cmd, dir); err != nil {
 		return nil, fmt.Errorf("PDF merge failed: %w - %s", err, stderr.String())
 	}
 
-	return os.ReadFile(outputPath)
+	return limits.ReadFile(outputPath)
 }
 
 // CompressPDF optimizes PDF file size using Ghostscript.
-func (p *PDFProcessor) CompressPDF(pdfData []byte) ([]byte, error) {
+func (p *PDFProcessor) CompressPDF(ctx context.Context, pdfData []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dir, cleanup, err := p.scratch("compress")
 	if err != nil {
-		return pdfData, nil
+		return nil, err
 	}
 	defer cleanup()
 
@@ -255,16 +282,16 @@ func (p *PDFProcessor) CompressPDF(pdfData []byte) ([]byte, error) {
 		inputPath,
 	}
 
-	cmd := exec.Command("gs", args...)
-	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "gs", args...)
+	var stderr diagnosticBuffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return pdfData, nil
+	if err := runCommand(ctx, cmd, dir); err != nil {
+		return nil, fmt.Errorf("compression failed: %w", err)
 	}
 
-	compressed, err := os.ReadFile(outputPath)
+	compressed, err := limits.ReadFile(outputPath)
 	if err != nil {
-		return pdfData, nil
+		return nil, err
 	}
 	if len(compressed) < len(pdfData) {
 		return compressed, nil
@@ -274,7 +301,12 @@ func (p *PDFProcessor) CompressPDF(pdfData []byte) ([]byte, error) {
 
 // Process applies the post-processing pipeline (watermark, metadata, security)
 // in an order that prevents later steps from invalidating earlier ones.
-func (p *PDFProcessor) Process(pdfData []byte, opts *models.PDFOptions) ([]byte, error) {
+func (p *PDFProcessor) Process(ctx context.Context, pdfData []byte, opts *models.PDFOptions) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if opts == nil {
 		return pdfData, nil
 	}
@@ -282,14 +314,14 @@ func (p *PDFProcessor) Process(pdfData []byte, opts *models.PDFOptions) ([]byte,
 	var err error
 
 	if opts.Watermark != nil && opts.Watermark.Text != "" {
-		pdfData, err = p.ApplyWatermark(pdfData, opts.Watermark)
+		pdfData, err = p.ApplyWatermark(ctx, pdfData, opts.Watermark)
 		if err != nil {
 			return nil, fmt.Errorf("watermark failed: %w", err)
 		}
 	}
 
 	if opts.Metadata != nil {
-		pdfData, err = p.SetMetadata(pdfData, opts.Metadata)
+		pdfData, err = p.SetMetadata(ctx, pdfData, opts.Metadata)
 		if err != nil {
 			return nil, fmt.Errorf("metadata failed: %w", err)
 		}
@@ -297,7 +329,7 @@ func (p *PDFProcessor) Process(pdfData []byte, opts *models.PDFOptions) ([]byte,
 
 	// Security must run last; encryption would block subsequent edits.
 	if opts.Security != nil {
-		pdfData, err = p.ApplySecurity(pdfData, opts.Security)
+		pdfData, err = p.ApplySecurity(ctx, pdfData, opts.Security)
 		if err != nil {
 			return nil, fmt.Errorf("security failed: %w", err)
 		}
@@ -307,7 +339,12 @@ func (p *PDFProcessor) Process(pdfData []byte, opts *models.PDFOptions) ([]byte,
 }
 
 // ConvertToPDFA converts PDF to PDF/A format for archival.
-func (p *PDFProcessor) ConvertToPDFA(pdfData []byte) ([]byte, error) {
+func (p *PDFProcessor) ConvertToPDFA(ctx context.Context, pdfData []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, limits.ProcessingTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dir, cleanup, err := p.scratch("pdfa")
 	if err != nil {
 		return nil, err
@@ -332,12 +369,12 @@ func (p *PDFProcessor) ConvertToPDFA(pdfData []byte) ([]byte, error) {
 		inputPath,
 	}
 
-	cmd := exec.Command("gs", args...)
-	if err := cmd.Run(); err != nil {
+	cmd := exec.CommandContext(ctx, "gs", args...)
+	if err := runCommand(ctx, cmd, dir); err != nil {
 		return nil, fmt.Errorf("PDF/A conversion failed: %w", err)
 	}
 
-	return os.ReadFile(outputPath)
+	return limits.ReadFile(outputPath)
 }
 
 // AddPageNumbersWithPDFCPU stamps page numbers via pdfcpu.
@@ -368,7 +405,7 @@ func AddPageNumbersWithPDFCPU(pdfData []byte, position, format string) ([]byte, 
 		return nil, fmt.Errorf("page-number setup failed: %w", err)
 	}
 
-	var out bytes.Buffer
+	var out limits.Buffer
 	if err := api.AddWatermarks(bytes.NewReader(pdfData), &out, nil, wm, model.NewDefaultConfiguration()); err != nil {
 		return nil, fmt.Errorf("page-number stamping failed: %w", err)
 	}

@@ -8,12 +8,14 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"pdf-forge/internal/limits"
 	"pdf-forge/internal/models"
 )
 
@@ -82,35 +84,49 @@ func (m *PDFManipulator) Split(ctx context.Context, req *SplitRequest) (*SplitRe
 	}
 
 	var pages [][]byte
+	var totalBytes int
 
 	switch req.SplitType {
 	case "all":
 		for i := 1; i <= pageCount; i++ {
 			outputPath := filepath.Join(dir, fmt.Sprintf("page_%d.pdf", i))
-			args := []string{inputPath, fmt.Sprintf("%d", i), outputPath}
+			args := []string{inputPath, "--pages", inputPath, fmt.Sprintf("%d", i), "--", outputPath}
 			if err := m.runQPDF(ctx, args...); err != nil {
 				return nil, fmt.Errorf("failed to extract page %d: %w", i, err)
 			}
-			pageData, err := os.ReadFile(outputPath)
+			pageData, err := limits.ReadFile(outputPath)
 			if err != nil {
 				return nil, err
 			}
+			if len(pageData) > limits.MaxOutputBytes-totalBytes {
+				return nil, limits.ErrOutputLimit
+			}
+			totalBytes += len(pageData)
 			pages = append(pages, pageData)
+			_ = os.Remove(outputPath)
 		}
 
 	case "range":
 		ranges := m.parsePageRanges(req.Pages, pageCount)
+		if len(ranges) > limits.MaxPages {
+			return nil, fmt.Errorf("too many page ranges")
+		}
 		for i, r := range ranges {
 			outputPath := filepath.Join(dir, fmt.Sprintf("range_%d.pdf", i))
 			args := []string{inputPath, "--pages", inputPath, r, "--", outputPath}
 			if err := m.runQPDF(ctx, args...); err != nil {
 				return nil, fmt.Errorf("failed to extract range %s: %w", r, err)
 			}
-			pageData, err := os.ReadFile(outputPath)
+			pageData, err := limits.ReadFile(outputPath)
 			if err != nil {
 				return nil, err
 			}
+			if len(pageData) > limits.MaxOutputBytes-totalBytes {
+				return nil, limits.ErrOutputLimit
+			}
+			totalBytes += len(pageData)
 			pages = append(pages, pageData)
+			_ = os.Remove(outputPath)
 		}
 
 	case "every_n":
@@ -129,11 +145,16 @@ func (m *PDFManipulator) Split(ctx context.Context, req *SplitRequest) (*SplitRe
 			if err := m.runQPDF(ctx, args...); err != nil {
 				return nil, fmt.Errorf("failed to extract chunk %s: %w", rangeStr, err)
 			}
-			pageData, err := os.ReadFile(outputPath)
+			pageData, err := limits.ReadFile(outputPath)
 			if err != nil {
 				return nil, err
 			}
+			if len(pageData) > limits.MaxOutputBytes-totalBytes {
+				return nil, limits.ErrOutputLimit
+			}
+			totalBytes += len(pageData)
 			pages = append(pages, pageData)
+			_ = os.Remove(outputPath)
 		}
 
 	default:
@@ -163,7 +184,7 @@ func (m *PDFManipulator) ExtractPages(ctx context.Context, pdf []byte, pageRange
 		return nil, fmt.Errorf("failed to extract pages: %w", err)
 	}
 
-	return os.ReadFile(outputPath)
+	return limits.ReadFile(outputPath)
 }
 
 // RotatePages rotates pages in a PDF.
@@ -196,7 +217,7 @@ func (m *PDFManipulator) RotatePages(ctx context.Context, pdf []byte, rotation i
 		return nil, fmt.Errorf("failed to rotate pages: %w", err)
 	}
 
-	return os.ReadFile(outputPath)
+	return limits.ReadFile(outputPath)
 }
 
 // CompressLevel defines compression levels
@@ -242,13 +263,13 @@ func (m *PDFManipulator) Compress(ctx context.Context, pdf []byte, level Compres
 	}
 
 	cmd := exec.CommandContext(ctx, "gs", args...)
-	var stderr bytes.Buffer
+	var stderr diagnosticBuffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runCommand(ctx, cmd, dir); err != nil {
 		return nil, 0, fmt.Errorf("compression failed: %w - %s", err, stderr.String())
 	}
 
-	compressed, err := os.ReadFile(outputPath)
+	compressed, err := limits.ReadFile(outputPath)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -285,32 +306,48 @@ func (m *PDFManipulator) PDFToImages(ctx context.Context, pdf []byte, format str
 		dpi = 150
 	}
 
-	args := []string{"-r", strconv.Itoa(dpi)}
-	switch format {
-	case "png":
-		args = append(args, "-png")
-	case "jpeg", "jpg":
-		args = append(args, "-jpeg")
-	default:
-		args = append(args, "-jpeg")
+	if dpi > limits.MaxDPI {
+		return nil, fmt.Errorf("DPI exceeds maximum %d", limits.MaxDPI)
 	}
-	args = append(args, inputPath, outputPrefix)
-
-	cmd := exec.CommandContext(ctx, "pdftoppm", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("PDF to image conversion failed: %w - %s", err, stderr.String())
+	count, err := m.getPageCount(ctx, inputPath)
+	if err != nil {
+		return nil, err
 	}
-
-	matches, _ := filepath.Glob(outputPrefix + "*")
+	sizes, err := m.pagePixelSizes(ctx, inputPath, count, dpi)
+	if err != nil {
+		return nil, err
+	}
 	var images [][]byte
-	for _, match := range matches {
-		imgData, err := os.ReadFile(match)
-		if err != nil {
-			continue
+	totalBytes := 0
+	for pageNo := 1; pageNo <= count; pageNo++ {
+		args := []string{"-r", strconv.Itoa(dpi), "-scale-to", strconv.Itoa(sizes[pageNo]), "-f", strconv.Itoa(pageNo), "-l", strconv.Itoa(pageNo), "-singlefile"}
+		ext := ".jpg"
+		switch format {
+		case "png":
+			args = append(args, "-png")
+			ext = ".png"
+		case "jpeg", "jpg":
+			args = append(args, "-jpeg")
+		default:
+			return nil, fmt.Errorf("unsupported image format: %s", format)
 		}
-		images = append(images, imgData)
+		args = append(args, inputPath, outputPrefix)
+		cmd := exec.CommandContext(ctx, "pdftoppm", args...)
+		var stderr diagnosticBuffer
+		cmd.Stderr = &stderr
+		if err := runCommand(ctx, cmd, dir); err != nil {
+			return nil, fmt.Errorf("PDF to image conversion failed: %w - %s", err, stderr.String())
+		}
+		data, err := limits.ReadFile(outputPrefix + ext)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > limits.MaxOutputBytes-totalBytes {
+			return nil, limits.ErrOutputLimit
+		}
+		totalBytes += len(data)
+		images = append(images, data)
+		_ = os.Remove(outputPrefix + ext)
 	}
 
 	return images, nil
@@ -400,6 +437,9 @@ func (m *PDFManipulator) RemovePages(ctx context.Context, pdf []byte, pagesToRem
 			if len(rangeParts) == 2 {
 				start, _ := strconv.Atoi(rangeParts[0])
 				end, _ := strconv.Atoi(rangeParts[1])
+				if start < 1 || end > pageCount || start > end {
+					return nil, fmt.Errorf("invalid page range")
+				}
 				for i := start; i <= end; i++ {
 					removeSet[i] = true
 				}
@@ -447,7 +487,7 @@ func (m *PDFManipulator) RemovePages(ctx context.Context, pdf []byte, pagesToRem
 		return nil, fmt.Errorf("failed to remove pages: %w", err)
 	}
 
-	return os.ReadFile(outputPath)
+	return limits.ReadFile(outputPath)
 }
 
 // ReorderPages reorders pages in a PDF.
@@ -465,6 +505,9 @@ func (m *PDFManipulator) ReorderPages(ctx context.Context, pdf []byte, newOrder 
 		return nil, fmt.Errorf("failed to write input: %w", err)
 	}
 
+	if len(newOrder) > limits.MaxPages {
+		return nil, fmt.Errorf("too many output pages")
+	}
 	pageStrs := make([]string, 0, len(newOrder))
 	for _, p := range newOrder {
 		pageStrs = append(pageStrs, strconv.Itoa(p))
@@ -476,16 +519,16 @@ func (m *PDFManipulator) ReorderPages(ctx context.Context, pdf []byte, newOrder 
 		return nil, fmt.Errorf("failed to reorder pages: %w", err)
 	}
 
-	return os.ReadFile(outputPath)
+	return limits.ReadFile(outputPath)
 }
 
 // Helpers
 
 func (m *PDFManipulator) runQPDF(ctx context.Context, args ...string) error {
 	cmd := exec.CommandContext(ctx, "qpdf", args...)
-	var stderr bytes.Buffer
+	var stderr diagnosticBuffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runCommand(ctx, cmd, filepath.Dir(args[len(args)-1])); err != nil {
 		return fmt.Errorf("%w: %s", err, stderr.String())
 	}
 	return nil
@@ -500,6 +543,9 @@ func (m *PDFManipulator) getPageCount(ctx context.Context, pdfPath string) (int,
 	count, err := strconv.Atoi(strings.TrimSpace(string(output)))
 	if err != nil {
 		return 0, fmt.Errorf("invalid page count: %w", err)
+	}
+	if count < 1 || count > limits.MaxPages {
+		return 0, fmt.Errorf("PDF must contain between 1 and %d pages", limits.MaxPages)
 	}
 	return count, nil
 }
@@ -549,5 +595,36 @@ func EncodeImage(img image.Image, format string) ([]byte, error) {
 // Position can be "bottom-center" (default), "bottom-left", "bottom-right",
 // "top-center", "top-left", "top-right".
 func (m *PDFManipulator) AddPageNumbers(ctx context.Context, pdf []byte, position, format string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return AddPageNumbersWithPDFCPU(pdf, position, format)
+}
+
+// pagePixelSizes preserves the requested DPI for normal pages and reduces it
+// only when a page would exceed the raster dimension limit.
+func (m *PDFManipulator) pagePixelSizes(ctx context.Context, path string, count, dpi int) (map[int]int, error) {
+	cmd := exec.CommandContext(ctx, "pdfinfo", "-f", "1", "-l", strconv.Itoa(count), path)
+	var output diagnosticBuffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := runCommand(ctx, cmd, filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("reading page dimensions: %w", err)
+	}
+	sizes := make(map[int]int, count)
+	for _, line := range strings.Split(output.String(), "\n") {
+		var pageNo int
+		var width, height float64
+		if n, _ := fmt.Sscanf(line, "Page %d size: %f x %f pts", &pageNo, &width, &height); n == 3 && pageNo >= 1 && pageNo <= count && width > 0 && height > 0 {
+			pixels := math.Ceil(math.Max(width, height) * float64(dpi) / 72)
+			if math.IsNaN(pixels) || math.IsInf(pixels, 0) {
+				return nil, fmt.Errorf("invalid page dimensions")
+			}
+			sizes[pageNo] = int(math.Min(4096, pixels))
+		}
+	}
+	if len(sizes) != count {
+		return nil, fmt.Errorf("could not determine all page dimensions")
+	}
+	return sizes, nil
 }

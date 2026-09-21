@@ -18,7 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const (
+var (
 	Version = "2.0.0"
 )
 
@@ -59,6 +59,7 @@ func main() {
 
 	// Create handlers
 	h := handlers.NewHandler(converter, processor, logger, Version)
+	h.SetProcessingWorkers(config.ProcessingWorkers)
 
 	// Create extended handler for advanced features
 	extHandler, err := handlers.NewExtendedHandler(h)
@@ -106,6 +107,7 @@ func main() {
 	chain = middleware.Logger(logger)(chain)
 	chain = middleware.RequestID(chain)
 	chain = middleware.MaxBodySize(config.MaxBodySize)(chain)
+	chain = middleware.Admission(config.MaxInflightRequests, config.MaxBodySize, config.MaxInflightBytes, config.RequestTimeout)(chain)
 
 	// Rate limiting (if enabled)
 	if config.RateLimit > 0 {
@@ -128,11 +130,12 @@ func main() {
 
 	// Create server with generous timeouts for large files
 	srv := &http.Server{
-		Addr:         config.Address,
-		Handler:      chain,
-		ReadTimeout:  config.ReadTimeout,
-		WriteTimeout: config.WriteTimeout,
-		IdleTimeout:  120 * time.Second,
+		Addr:              config.Address,
+		Handler:           chain,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       config.ReadTimeout,
+		WriteTimeout:      config.WriteTimeout,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Start server in goroutine
@@ -163,26 +166,34 @@ func main() {
 }
 
 type Config struct {
-	Address      string
-	APIKey       string
-	MaxWorkers   int
-	MaxBodySize  int64
-	RateLimit    int
-	CORSOrigins  []string
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
+	Address             string
+	APIKey              string
+	MaxWorkers          int
+	ProcessingWorkers   int
+	MaxInflightRequests int
+	MaxInflightBytes    int64
+	RequestTimeout      time.Duration
+	MaxBodySize         int64
+	RateLimit           int
+	CORSOrigins         []string
+	ReadTimeout         time.Duration
+	WriteTimeout        time.Duration
 }
 
 func loadConfig() Config {
 	return Config{
-		Address:      getEnv("ADDRESS", ":8080"),
-		APIKey:       os.Getenv("API_KEY"),
-		MaxWorkers:   getEnvInt("MAX_WORKERS", 4),
-		MaxBodySize:  getEnvInt64("MAX_BODY_SIZE", 500*1024*1024), // 500MB default
-		RateLimit:    getEnvInt("RATE_LIMIT", 0),                  // 0 = disabled
-		CORSOrigins:  getEnvSlice("CORS_ORIGINS", nil),
-		ReadTimeout:  time.Duration(getEnvInt("READ_TIMEOUT", 300)) * time.Second,
-		WriteTimeout: time.Duration(getEnvInt("WRITE_TIMEOUT", 300)) * time.Second,
+		Address:             getEnv("ADDRESS", ":8080"),
+		APIKey:              os.Getenv("API_KEY"),
+		MaxWorkers:          positiveInt("MAX_WORKERS", 4),
+		ProcessingWorkers:   positiveInt("PROCESSING_WORKERS", 2),
+		MaxInflightRequests: positiveInt("MAX_INFLIGHT_REQUESTS", 16),
+		MaxInflightBytes:    positiveInt64("MAX_INFLIGHT_BYTES", 128<<20),
+		RequestTimeout:      time.Duration(positiveInt("REQUEST_TIMEOUT", 120)) * time.Second,
+		MaxBodySize:         positiveInt64("MAX_BODY_SIZE", 32<<20),
+		RateLimit:           getEnvInt("RATE_LIMIT", 0), // 0 = disabled
+		CORSOrigins:         getEnvSlice("CORS_ORIGINS", nil),
+		ReadTimeout:         time.Duration(getEnvInt("READ_TIMEOUT", 300)) * time.Second,
+		WriteTimeout:        time.Duration(getEnvInt("WRITE_TIMEOUT", 300)) * time.Second,
 	}
 }
 
@@ -251,4 +262,19 @@ func init() {
 `
 	fmt.Println(banner)
 	fmt.Printf("PDF Forge v%s - High-Performance PDF Conversion Microservice\n\n", Version)
+}
+
+func positiveInt(key string, def int) int {
+	n := getEnvInt(key, def)
+	if n <= 0 {
+		return def
+	}
+	return n
+}
+func positiveInt64(key string, def int64) int64 {
+	n := getEnvInt64(key, def)
+	if n <= 0 {
+		return def
+	}
+	return n
 }

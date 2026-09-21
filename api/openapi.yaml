@@ -325,6 +325,10 @@ components:
     PDFOptions:
       type: object
       properties:
+        wait_for_expression:
+          type: string
+          description: JavaScript readiness predicate, with a 30-second maximum within the render deadline.
+          example: window.reportReady === true
         page_size:
           type: string
           enum: [A4, A3, Letter, Legal, Tabloid, Custom]

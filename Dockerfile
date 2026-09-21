@@ -12,16 +12,16 @@ WORKDIR /build
 RUN apk add --no-cache git ca-certificates tzdata
 
 # Copy go mod files first for better caching
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
 
 # Copy source code
 COPY . .
 
-# Download dependencies and generate go.sum
-RUN go mod tidy && go mod download
-
 # Build with optimizations
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -mod=readonly \
     -ldflags="-w -s -X main.Version=$(date +%Y%m%d)" \
     -o pdf-forge \
     ./cmd/server

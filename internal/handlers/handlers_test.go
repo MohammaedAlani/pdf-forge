@@ -102,3 +102,15 @@ func TestMaxBodySize_Returns413(t *testing.T) {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
 	}
 }
+
+func TestRawHTMLBodyLimit(t *testing.T) {
+	h := newHandlerForTest()
+	handler := middleware.MaxBodySize(8)(http.HandlerFunc(h.ConvertHTML))
+	r := httptest.NewRequest("POST", "/html", strings.NewReader("<h1>too large</h1>"))
+	r.Header.Set("Content-Type", "text/html")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("got %d: %s", w.Code, w.Body.String())
+	}
+}

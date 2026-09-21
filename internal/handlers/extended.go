@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"pdf-forge/internal/converters"
+	"pdf-forge/internal/limits"
 	"pdf-forge/internal/metrics"
 	"pdf-forge/internal/middleware"
 	"pdf-forge/internal/models"
@@ -17,7 +19,7 @@ import (
 )
 
 // maxConcurrentAsync caps how many /async jobs can be in flight at once.
-// Larger payloads block until a slot frees instead of forking unlimited goroutines.
+// HTTP admission additionally bounds retained payloads through delivery.
 const maxConcurrentAsync = 32
 
 // ExtendedHandler adds template and manipulation handlers.
@@ -28,6 +30,12 @@ type ExtendedHandler struct {
 	webhookSvc     *services.WebhookService
 	storageSvc     *services.StorageService
 	asyncSlots     chan struct{}
+	deliverySlots  limits.Gate
+	jobsCtx        context.Context
+	cancelJobs     context.CancelFunc
+	jobs           sync.WaitGroup
+	jobsMu         sync.Mutex
+	closing        bool
 }
 
 // NewExtendedHandler creates an extended handler with all features.
@@ -37,6 +45,7 @@ func NewExtendedHandler(h *Handler) (*ExtendedHandler, error) {
 		return nil, fmt.Errorf("failed to create manipulator: %w", err)
 	}
 
+	jobsCtx, cancelJobs := context.WithCancel(context.Background())
 	return &ExtendedHandler{
 		Handler:        h,
 		templateEngine: templates.NewTemplateEngine(),
@@ -44,11 +53,18 @@ func NewExtendedHandler(h *Handler) (*ExtendedHandler, error) {
 		webhookSvc:     services.NewWebhookService(h.logger),
 		storageSvc:     services.NewStorageService(h.logger),
 		asyncSlots:     make(chan struct{}, maxConcurrentAsync),
+		deliverySlots:  limits.NewGate(4),
+		jobsCtx:        jobsCtx, cancelJobs: cancelJobs,
 	}, nil
 }
 
 // Close releases resources.
 func (h *ExtendedHandler) Close() error {
+	h.jobsMu.Lock()
+	h.closing = true
+	h.cancelJobs()
+	h.jobsMu.Unlock()
+	h.jobs.Wait()
 	if h.manipulator != nil {
 		return h.manipulator.Close()
 	}
@@ -100,7 +116,7 @@ func (h *ExtendedHandler) Template(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Options != nil && h.processor != nil {
-		pdfData, err = h.processor.Process(pdfData, req.Options)
+		pdfData, err = h.process(r.Context(), pdfData, req.Options)
 		if err != nil {
 			metrics.Record("template", "failure", time.Since(start).Seconds(), 0)
 			h.errorResponse(w, http.StatusInternalServerError, "Post-processing failed: "+err.Error(), requestID)
@@ -137,7 +153,13 @@ func (h *ExtendedHandler) Manipulate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), limits.ProcessingTimeout)
+	defer cancel()
+	if err := h.processing.Acquire(ctx); err != nil {
+		h.errorResponse(w, http.StatusGatewayTimeout, err.Error(), requestID)
+		return
+	}
+	defer h.processing.Release()
 	result := &models.ManipulateResult{Operation: req.Operation, Success: true}
 	start := time.Now()
 
@@ -300,6 +322,10 @@ func (h *ExtendedHandler) Manipulate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ctx.Err() != nil {
+		result.Success = false
+		result.Message = ctx.Err().Error()
+	}
 	outcome := "success"
 	if !result.Success {
 		outcome = "failure"
@@ -338,14 +364,29 @@ func (h *ExtendedHandler) Async(w http.ResponseWriter, r *http.Request) {
 		h.errorResponse(w, http.StatusServiceUnavailable, "Async queue is full, retry later", requestID)
 		return
 	}
-	metrics.AsyncQueueDepth.Set(float64(len(h.asyncSlots)))
-
+	h.jobsMu.Lock()
+	if h.closing {
+		h.jobsMu.Unlock()
+		<-h.asyncSlots
+		h.errorResponse(w, http.StatusServiceUnavailable, "Server shutting down", requestID)
+		return
+	}
+	h.jobs.Add(1)
+	h.jobsMu.Unlock()
+	metrics.AsyncQueueDepth.Inc()
+	releaseInput := middleware.RetainAdmission(r.Context())
+	var once sync.Once
+	releaseConversion := func() { once.Do(func() { <-h.asyncSlots; metrics.AsyncQueueDepth.Dec() }) }
 	go func() {
+		defer h.jobs.Done()
+		defer releaseInput()
+		defer releaseConversion()
 		defer func() {
-			<-h.asyncSlots
-			metrics.AsyncQueueDepth.Set(float64(len(h.asyncSlots)))
+			if v := recover(); v != nil {
+				h.logger.Error("Async job panicked", "request_id", requestID, "error", v)
+			}
 		}()
-		h.processAsync(requestID, &req)
+		h.processAsync(requestID, &req, releaseConversion)
 	}()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -357,8 +398,8 @@ func (h *ExtendedHandler) Async(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *ExtendedHandler) processAsync(requestID string, req *models.AsyncRequest) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+func (h *ExtendedHandler) processAsync(requestID string, req *models.AsyncRequest, releaseConversion func()) {
+	ctx, cancel := context.WithTimeout(h.jobsCtx, 5*time.Minute)
 	defer cancel()
 
 	startTime := time.Now()
@@ -367,45 +408,16 @@ func (h *ExtendedHandler) processAsync(requestID string, req *models.AsyncReques
 		convType = "html"
 	}
 
-	var pdfData []byte
-	var err error
-
-	switch req.Request.Type {
-	case models.ConvertHTML, "":
-		html := req.Request.HTML
-		if req.Request.IsBase64 {
-			decoded, decErr := base64.StdEncoding.DecodeString(html)
-			if decErr != nil {
-				err = decErr
-			} else {
-				html = string(decoded)
-			}
-		}
-		if err == nil {
-			pdfData, err = h.converter.ConvertHTML(ctx, html, req.Request.Options)
-		}
-	case models.ConvertURL:
-		pdfData, err = h.converter.ConvertURL(ctx, req.Request.URL, req.Request.Options)
-	case models.ConvertMarkdown:
-		pdfData, err = h.converter.ConvertMarkdown(ctx, req.Request.Markdown, req.Request.Options)
-	case models.ConvertImage:
-		pdfData, err = h.converter.ConvertImage(ctx, req.Request.Image, req.Request.Options)
-	case models.ConvertImages:
-		pdfData, err = h.converter.ConvertImages(ctx, req.Request.Images, req.Request.Options)
-	default:
-		err = fmt.Errorf("unsupported conversion type: %s", req.Request.Type)
-	}
-
-	duration := time.Since(startTime)
-
-	if err == nil && req.Request.Options != nil && h.processor != nil {
-		pdfData, err = h.processor.Process(pdfData, req.Request.Options)
-	}
+	pdfData, err := h.convertItem(ctx, &req.Request)
 
 	var storageResult *models.StorageResult
 	if err == nil && req.Storage != nil {
 		storageResult, err = h.storageSvc.Upload(ctx, req.Storage, pdfData, "application/pdf")
 	}
+
+	duration := time.Since(startTime)
+	releaseConversion()
+	defer func() { metrics.StageDuration.WithLabelValues("async_total").Observe(time.Since(startTime).Seconds()) }()
 
 	outcome := "success"
 	if err != nil {
@@ -423,6 +435,13 @@ func (h *ExtendedHandler) processAsync(requestID string, req *models.AsyncReques
 			payload.Storage = storageResult
 		}
 
+		deliveryStart := time.Now()
+		if gateErr := h.deliverySlots.Acquire(ctx); gateErr != nil {
+			h.logger.Error("Webhook admission failed", "request_id", requestID, "error", gateErr)
+			return
+		}
+		defer h.deliverySlots.Release()
+		defer func() { metrics.StageDuration.WithLabelValues("delivery").Observe(time.Since(deliveryStart).Seconds()) }()
 		if webhookErr := h.webhookSvc.Send(ctx, req.Webhook, payload); webhookErr != nil {
 			h.logger.Error("Webhook delivery failed", "request_id", requestID, "error", webhookErr.Error())
 		}
@@ -451,75 +470,82 @@ func (h *ExtendedHandler) Batch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := &models.BatchResult{
-		RequestID: requestID,
-		Total:     len(req.Requests),
-		Results:   make([]models.BatchItemResult, 0, len(req.Requests)),
+	if len(req.Requests) > limits.MaxBatchItems {
+		h.errorResponse(w, http.StatusBadRequest, "Batch exceeds 32 items", requestID)
+		return
 	}
-
-	var allPDFs [][]byte
-
-	for i, convReq := range req.Requests {
-		itemResult := models.BatchItemResult{Index: i}
-
-		var pdfData []byte
-		var err error
-		ctx := r.Context()
-
-		switch convReq.Type {
-		case models.ConvertHTML, "":
-			html := convReq.HTML
-			if convReq.IsBase64 {
-				decoded, _ := base64.StdEncoding.DecodeString(html)
-				html = string(decoded)
-			}
-			pdfData, err = h.converter.ConvertHTML(ctx, html, convReq.Options)
-		case models.ConvertURL:
-			pdfData, err = h.converter.ConvertURL(ctx, convReq.URL, convReq.Options)
-		case models.ConvertMarkdown:
-			pdfData, err = h.converter.ConvertMarkdown(ctx, convReq.Markdown, convReq.Options)
-		case models.ConvertImage:
-			pdfData, err = h.converter.ConvertImage(ctx, convReq.Image, convReq.Options)
-		case models.ConvertImages:
-			pdfData, err = h.converter.ConvertImages(ctx, convReq.Images, convReq.Options)
-		default:
-			err = fmt.Errorf("unsupported type: %s", convReq.Type)
-		}
-
-		if err != nil {
-			itemResult.Success = false
-			itemResult.Error = err.Error()
-			result.Failed++
-		} else {
-			if convReq.Options != nil && h.processor != nil {
-				pdfData, err = h.processor.Process(pdfData, convReq.Options)
+	if req.Merge && h.processor == nil {
+		h.errorResponse(w, http.StatusServiceUnavailable, "PDF processor unavailable", requestID)
+		return
+	}
+	start := time.Now()
+	result := &models.BatchResult{RequestID: requestID, Total: len(req.Requests), Results: make([]models.BatchItemResult, len(req.Requests))}
+	allPDFs := make([][]byte, len(req.Requests))
+	var mu sync.Mutex
+	var outputBytes int
+	// Two items per batch prevents a single batch creating an unbounded fan-out.
+	var wg sync.WaitGroup
+	jobs := make(chan int)
+	for worker := 0; worker < min(2, len(req.Requests)); worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				itemStart := time.Now()
+				pdf, err := h.convertItem(r.Context(), &req.Requests[i])
+				mu.Lock()
+				if err == nil {
+					if len(pdf) > limits.MaxOutputBytes-outputBytes {
+						err = limits.ErrOutputLimit
+					} else {
+						outputBytes += len(pdf)
+					}
+				}
+				mu.Unlock()
+				item := models.BatchItemResult{Index: i}
+				outcome := "failure"
 				if err != nil {
-					itemResult.Success = false
-					itemResult.Error = err.Error()
-					result.Failed++
+					item.Error = err.Error()
+				} else {
+					item.Success = true
+					item.Size = int64(len(pdf))
+					outcome = "success"
+					if req.Merge {
+						allPDFs[i] = pdf
+					} else {
+						item.PDF = base64.StdEncoding.EncodeToString(pdf)
+					}
 				}
+				result.Results[i] = item
+				metrics.Record("batch.item", outcome, time.Since(itemStart).Seconds(), len(pdf))
 			}
-
-			if err == nil {
-				itemResult.Success = true
-				itemResult.Size = int64(len(pdfData))
-				if !req.Merge {
-					itemResult.PDF = base64.StdEncoding.EncodeToString(pdfData)
-				}
-				result.Completed++
-				allPDFs = append(allPDFs, pdfData)
+		}()
+	}
+	for i := range req.Requests {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	var mergePDFs [][]byte
+	for i, item := range result.Results {
+		if item.Success {
+			result.Completed++
+			if req.Merge {
+				mergePDFs = append(mergePDFs, allPDFs[i])
 			}
-		}
-
-		result.Results = append(result.Results, itemResult)
-	}
-
-	if req.Merge && len(allPDFs) > 0 && h.processor != nil {
-		merged, err := h.processor.MergePDFs(allPDFs)
-		if err == nil {
-			result.MergedPDF = base64.StdEncoding.EncodeToString(merged)
+		} else {
+			result.Failed++
 		}
 	}
+	if req.Merge && len(mergePDFs) > 0 {
+		merged, err := h.merge(r.Context(), mergePDFs)
+		if err != nil {
+			h.errorResponse(w, http.StatusInternalServerError, "Batch merge failed: "+err.Error(), requestID)
+			return
+		}
+		result.MergedPDF = base64.StdEncoding.EncodeToString(merged)
+	}
+	metrics.StageDuration.WithLabelValues("batch").Observe(time.Since(start).Seconds())
 
 	h.logger.Info("Batch conversion completed",
 		"request_id", requestID,
@@ -534,6 +560,10 @@ func (h *ExtendedHandler) Batch(w http.ResponseWriter, r *http.Request) {
 
 // TableToPDF converts table data (CSV/JSON) to PDF.
 func (h *ExtendedHandler) TableToPDF(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	outcome := "failure"
+	outputSize := 0
+	defer func() { metrics.Record("table", outcome, time.Since(start).Seconds(), outputSize) }()
 	requestID := middleware.GetRequestID(r.Context())
 
 	var req struct {
@@ -554,13 +584,15 @@ func (h *ExtendedHandler) TableToPDF(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Options != nil && h.processor != nil {
-		pdfData, err = h.processor.Process(pdfData, req.Options)
+		pdfData, err = h.process(r.Context(), pdfData, req.Options)
 		if err != nil {
 			h.errorResponse(w, http.StatusInternalServerError, "Processing failed: "+err.Error(), requestID)
 			return
 		}
 	}
 
+	outcome = "success"
+	outputSize = len(pdfData)
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(pdfData)))
 	_, _ = w.Write(pdfData)
@@ -610,4 +642,38 @@ tr:nth-child(even) { background: #f7fafc; }
 
 	b = append(b, []byte("</body></html>")...)
 	return string(b)
+}
+
+func (h *ExtendedHandler) convertItem(ctx context.Context, req *models.ConversionRequest) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var pdf []byte
+	var err error
+	switch req.Type {
+	case models.ConvertHTML, "":
+		html := req.HTML
+		if req.IsBase64 {
+			data, e := base64.StdEncoding.DecodeString(html)
+			if e != nil {
+				return nil, e
+			}
+			html = string(data)
+		}
+		pdf, err = h.converter.ConvertHTML(ctx, html, req.Options)
+	case models.ConvertURL:
+		pdf, err = h.converter.ConvertURL(ctx, req.URL, req.Options)
+	case models.ConvertMarkdown:
+		pdf, err = h.converter.ConvertMarkdown(ctx, req.Markdown, req.Options)
+	case models.ConvertImage:
+		pdf, err = h.converter.ConvertImage(ctx, req.Image, req.Options)
+	case models.ConvertImages:
+		pdf, err = h.converter.ConvertImages(ctx, req.Images, req.Options)
+	default:
+		return nil, fmt.Errorf("unsupported conversion type: %s", req.Type)
+	}
+	if err == nil && h.processor != nil {
+		pdf, err = h.process(ctx, pdf, req.Options)
+	}
+	return pdf, err
 }

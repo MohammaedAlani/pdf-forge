@@ -8,11 +8,18 @@ services:
       - "8080:8080"
     environment:
       - ADDRESS=:8080
-      - MAX_WORKERS=4
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+      - CHROME_USE_DEV_SHM=${CHROME_USE_DEV_SHM:-true}
+      - MAX_BODY_SIZE=${MAX_BODY_SIZE:-33554432}
+      - PROCESSING_WORKERS=${PROCESSING_WORKERS:-2}
+      - MAX_INFLIGHT_REQUESTS=${MAX_INFLIGHT_REQUESTS:-16}
+      - MAX_INFLIGHT_BYTES=${MAX_INFLIGHT_BYTES:-134217728}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-120}
       - LOG_LEVEL=info
       - API_KEY=${API_KEY:-}
       - RATE_LIMIT=${RATE_LIMIT:-0}
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    shm_size: 256mb
     restart: unless-stopped
     deploy:
       resources:

@@ -110,17 +110,19 @@ type HeaderFooter struct {
 
 // PDFOptions contains all PDF generation options
 type PDFOptions struct {
-	PageSize         PageSize        `json:"page_size,omitempty"`
-	CustomDimensions *PageDimensions `json:"custom_dimensions,omitempty"`
-	Orientation      Orientation     `json:"orientation,omitempty"`
-	Margins          *Margins        `json:"margins,omitempty"`
-	Security         *PDFSecurity    `json:"security,omitempty"`
-	Metadata         *PDFMetadata    `json:"metadata,omitempty"`
-	Watermark        *Watermark      `json:"watermark,omitempty"`
-	HeaderFooter     *HeaderFooter   `json:"header_footer,omitempty"`
-	PrintBackground  bool            `json:"print_background"`
-	Scale            float64         `json:"scale,omitempty"` // 0.1 to 2.0
-	Grayscale        bool            `json:"grayscale,omitempty"`
+	// WaitForExpression is an optional JavaScript readiness predicate (30s maximum).
+	WaitForExpression string          `json:"wait_for_expression,omitempty"`
+	PageSize          PageSize        `json:"page_size,omitempty"`
+	CustomDimensions  *PageDimensions `json:"custom_dimensions,omitempty"`
+	Orientation       Orientation     `json:"orientation,omitempty"`
+	Margins           *Margins        `json:"margins,omitempty"`
+	Security          *PDFSecurity    `json:"security,omitempty"`
+	Metadata          *PDFMetadata    `json:"metadata,omitempty"`
+	Watermark         *Watermark      `json:"watermark,omitempty"`
+	HeaderFooter      *HeaderFooter   `json:"header_footer,omitempty"`
+	PrintBackground   bool            `json:"print_background"`
+	Scale             float64         `json:"scale,omitempty"` // 0.1 to 2.0
+	Grayscale         bool            `json:"grayscale,omitempty"`
 }
 
 // DefaultOptions returns sensible defaults

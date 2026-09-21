@@ -112,7 +112,7 @@ func (s *StorageService) uploadToS3(ctx context.Context, config *models.StorageC
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		return nil, fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
 	}
 

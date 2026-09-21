@@ -26,7 +26,7 @@
 ### 🔄 Multi-Format Conversion
 | Input | Output | Description |
 |-------|--------|-------------|
-| HTML | PDF | Raw HTML or Base64, handles 500MB+ files |
+| HTML | PDF | Raw HTML or Base64, bounded request and output sizes |
 | URL | PDF | Screenshot any webpage |
 | Images | PDF | PNG, JPG, GIF, WebP - single or batch |
 | Markdown | PDF | With syntax highlighting |
@@ -358,7 +358,12 @@ Process in background with webhook callback:
 | `ADDRESS` | `:8080` | Listen address |
 | `API_KEY` | - | API key for auth |
 | `MAX_WORKERS` | `4` | Concurrent workers |
-| `MAX_BODY_SIZE` | `500MB` | Max request size |
+| `CHROME_USE_DEV_SHM` | `false` | Use /dev/shm for Chrome; Compose enables it with a 256 MiB mount |
+| `MAX_BODY_SIZE` | `33554432` | Max request bytes (32 MiB) |
+| `MAX_INFLIGHT_REQUESTS` | `16` | Admitted requests, including background jobs through delivery |
+| `MAX_INFLIGHT_BYTES` | `134217728` | Reserved input bytes (128 MiB); unknown-length requests reserve MAX_BODY_SIZE |
+| `PROCESSING_WORKERS` | `2` | Concurrent post-processing, merge, and manipulation jobs |
+| `REQUEST_TIMEOUT` | `120` | Synchronous request deadline in seconds |
 | `RATE_LIMIT` | `0` | Requests/min (0=off) |
 
 ---
@@ -413,3 +418,55 @@ MIT License - see [LICENSE](LICENSE)
 ⭐ **Star this repo if you find it useful!**
 
 </div>
+
+## Performance and resource limits
+
+Chrome stays running between jobs. Each job uses an isolated browser context,
+so cookies and browser storage are not shared. Browser crashes fail active jobs;
+the next conversion attempts to start a new browser. Rendering waits for page
+load, fonts, and image decoding. For pages populated asynchronously, provide
+`options.wait_for_expression`, for example `"window.reportReady === true"`.
+The predicate has a 30-second limit within the overall render deadline.
+
+Admission runs before body decoding. Overloaded requests receive HTTP 503 with
+`Retry-After: 1`; oversized bodies receive HTTP 413. The input byte budget is
+not a total memory limit: Chrome, PDF libraries, decoded inputs, and outputs
+consume additional memory. Existing deployments explicitly setting a larger
+`MAX_BODY_SIZE` must also configure a suitable `MAX_INFLIGHT_BYTES` budget.
+
+Outputs are limited to 32 MiB of decoded data per document or batch. Batches
+and merges accept at most 32 inputs, and batches process two items concurrently
+while retaining response order. Split/rasterization inputs are limited to 100
+pages; rasterization accepts at most 300 DPI and caps the longest image edge
+at 4096 pixels. Outputs are generated one page at a time. PDF subprocesses have
+a 90-second processing deadline and a best-effort 64 MiB scratch-directory guard.
+Pure-Go PDF library calls check cancellation between stages; they cannot be
+interrupted in the middle of a library call. Container limits remain essential.
+
+Async jobs have a five-minute deadline and retain admission reservations until
+completion. Four webhook deliveries can run concurrently, independently of the
+rendering and post-processing slots. Slow callbacks can still exhaust the shared
+admission budget, deliberately bounding retained work. Jobs and callbacks remain
+in memory; shutdown cancels them and they are not durable across restarts.
+
+Rate limits use the direct peer IP (source ports are ignored). Forwarded headers
+are not trusted; behind a reverse proxy the limit therefore applies to the proxy
+IP. Health and metrics bypass rate and resource admission limits.
+
+Both Compose files reserve 256 MiB for Chrome shared memory and enable
+`CHROME_USE_DEV_SHM=true`. Other deployments retain Chrome’s temporary-directory
+fallback by default; enable shared memory only after provisioning adequate
+`/dev/shm` capacity. Monitor container-wide memory
+and temporary storage, not only Go runtime metrics. Additional Prometheus series
+include browser launches, admission rejections/reserved bytes, render queue time,
+rendering, post-processing, batch, delivery, and total async durations.
+
+Run checks with `go test -race ./...` and `go vet ./...`. With Chrome installed,
+run browser reuse, isolation, cancellation, and crash recovery checks using:
+
+```sh
+PDFFORGE_CHROME_TESTS=1 go test -race ./internal/converters
+```
+
+See [PERFORMANCE_ASSESSMENT.md](PERFORMANCE_ASSESSMENT.md) for the original baseline
+and the implementation validation results.
