@@ -21,8 +21,13 @@ COPY . .
 # Build with optimizations
 ARG TARGETOS
 ARG TARGETARCH
+# VERSION is stamped into /health so a running pod says exactly which commit it
+# is. CI passes the git SHA and then polls /health until it sees that SHA, which
+# is what turns "ArgoCD silently never deployed" into a red build. Falls back to
+# the build date for local `docker build` with no --build-arg.
+ARG VERSION
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -mod=readonly \
-    -ldflags="-w -s -X main.Version=$(date +%Y%m%d)" \
+    -ldflags="-w -s -X main.Version=${VERSION:-$(date +%Y%m%d)}" \
     -o pdf-forge \
     ./cmd/server
 

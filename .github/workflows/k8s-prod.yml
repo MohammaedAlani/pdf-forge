@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Two pushes in quick succession would otherwise race on the platform-repo
+# Contents API PUT (read sha -> PUT) and one bump would be lost with a 409.
+concurrency:
+  group: pdf-forge-prod-deploy
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -40,6 +46,8 @@ jobs:
           push: true
           provenance: false
           sbom: false
+          build-args: |
+            VERSION=${{ env.SHA }}
           tags: |
             ${{ env.IMAGE }}:${{ env.SHA }}
             ${{ env.IMAGE }}:prod
@@ -66,3 +74,29 @@ jobs:
             "https://api.github.com/repos/$PLATFORM_REPO/contents/$VALUES_FILE" \
             -d "{\"message\":\"pdf-forge prod: bump to $SHA\",\"content\":\"$NEW_B64\",\"sha\":\"$OLD_SHA\",\"branch\":\"$PLATFORM_BRANCH\"}" \
             -o /dev/null -w "  PUT $VALUES_FILE -> HTTP %{http_code}\n"
+
+      # Without this the pipeline is green the moment the tag is bumped, and a
+      # broken ArgoCD (unlisted destination namespace, bad project, missing
+      # path) is invisible. prod-pdf-forge sat Unknown/Unknown for 130 days
+      # exactly this way while every run here reported success.
+      - name: Verify the new build is actually serving
+        env:
+          HEALTH_URL: https://pdf.cloudfares.net/health
+          TIMEOUT_SECONDS: '600'
+          POLL_SECONDS: '10'
+        run: |
+          set -u
+          deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
+          live=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            live=$(curl -fsS --max-time 10 "$HEALTH_URL" 2>/dev/null               | python3 -c "import sys,json;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || echo "")
+            if [ "$live" = "$SHA" ]; then
+              echo "deployed: $HEALTH_URL reports $live"
+              exit 0
+            fi
+            echo "waiting for rollout - live='$live' want='$SHA'"
+            sleep "$POLL_SECONDS"
+          done
+          echo "::error::Image was pushed and the tag was bumped, but $HEALTH_URL still reports '$live' after ${TIMEOUT_SECONDS}s (expected '$SHA')."
+          echo "::error::ArgoCD has not rolled this out. Check: kubectl -n argocd get app prod-pdf-forge -o jsonpath='{.status.conditions[*].message}'"
+          exit 1
